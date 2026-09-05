@@ -60,7 +60,25 @@ ultimately hosts is deliberately undecided at this stage.
 The rating model, template ecosystem, anonymous identity model, verification concept,
 member indexing strategy, and comment limits are designed at prototype level.
 
-No final implementation is assumed by this document.
+### v1-core slice — built (2026-09-05)
+
+The minimum coherent surface is implemented as a see-and-feel skeleton: **find a member →
+rate them (direct 0–5, half-star) → see the aggregate**. A Cloudflare Worker + D1, runnable
+fully local via `wrangler dev` (no Cloudflare account needed). Verified end-to-end: rating,
+re-rating updates rather than stacks (one browser = one current rating per member), aggregate
+across raters, input validation.
+
+Deliberate scope of this slice:
+
+- IN: minimal member index (search seeded demo members), direct half-star rating, a
+  browser-cookie meta identity used only as the rating's ownership key, a profile aggregate.
+- OUT (deferred, by design): anti-abuse hardening (v1 is intentionally trivial to game —
+  it exists to feel the model with honest users), weighted criteria/templates, the activity
+  component, comments, Flashback verification, and live upstream member lookup (the index is
+  seeded with synthetic demo members — no real person is rated in the skeleton).
+- Stack note: served by the Worker as an inline front end; React/Vite (the preferred stack)
+  is deferred until the surface grows — it is a preference, not a v1 requirement.
+- Deploy is deferred with the rest of the CF infrastructure (alchemist); the slice runs local.
 
 ## Roadmap
 

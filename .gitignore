@@ -1,1 +1,7 @@
 docs/.gitignore
+
+# build / runtime artifacts
+node_modules/
+.wrangler/
+dist/
+

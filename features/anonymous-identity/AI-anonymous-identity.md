@@ -3,9 +3,16 @@ feature: anonymous-identity
 status: prototype
 major: v1
 fork: F0
+governs:
+  - src/worker.ts
 ---
 
 # Anonymous identity — agent contract
+
+> **v1-core slice (built 2026-09-05):** a browser cookie (`fb_meta`, random UUID) used ONLY as
+> the rating's ownership key — one browser = one current rating per member. No fingerprint, no
+> signal set, no sybil/velocity resistance: v1 is intentionally trivial to game. The full
+> anti-abuse hardening (Q2 signal set etc.) is the deferred next layer.
 
 ## Invariants
 

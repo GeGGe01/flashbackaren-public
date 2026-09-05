@@ -3,9 +3,17 @@ feature: member-index
 status: prototype
 major: v1
 fork: F0
+governs:
+  - src/worker.ts
+  - migrations/0002_seed_demo.sql
 ---
 
 # Member index — agent contract
+
+> **v1-core slice (built 2026-09-05):** local search over a seeded index only. The index is
+> pre-seeded with synthetic demo members (`0002_seed_demo.sql`) — upstream lookup on miss and
+> the real Q5 pre-seed (early members / moderators) are deferred, so the skeleton indexes no
+> real person. UID is the primary key; username is stored verbatim.
 
 ## Invariants
 
