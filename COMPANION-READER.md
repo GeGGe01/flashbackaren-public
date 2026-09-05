@@ -177,11 +177,23 @@ verified against a Flashback account.
 
 These are review notes on the vision above, kept distinct from Dexter's authored capture.
 
-- **Content re-hosting is a different axis than authentication.** The trust-domain boundary is
-  airtight on auth/privacy, but V4 re-presents users' *posts* (copyrighted content) under our
-  surface. That is a copyright / database-right / ToS question the auth boundary does not cover,
-  and it concentrates at **V4, not V5**. It needs an explicit position (transformative/excerpt vs
-  full render; attribution + canonical link back to the original).
+- **Content re-hosting — RESOLVED (operator): store facts + our own layer, proxy their content.**
+  The copyright / BBS-lagen exposure lives in *storing/re-hosting* Flashback's creative content, so
+  we don't. The clean line:
+  - **Stored (SoT):** our own layer + facts — reputation, the **member index** (UID + username +
+    derived facts), follows. The member index is the architecturally-selected source of truth that
+    *every* feature builds on; it is stored, never re-fetched per use. UID/username are
+    identifiers/facts, not creative content — no copyright/BBS issue.
+  - **Proxied / transient (never persisted):** Flashback's creative content (post bodies). When the
+    reader or content search needs it, it is proxied through, not stored — a *conduit*, not a
+    *host*. That keeps the copyright/re-hosting question and BBS-lagen host-status off Flashback's
+    content.
+  - **Search splits accordingly:** member search = our stored index; content/thread search = proxy
+    Flashback's own search, with reputation injected.
+  - Our *own* stored user content (the V1 free-text reviews) still makes us an anslagstavla for
+    those under the minimal remove-illegal moderation stance; that BBS duty is acknowledged and
+    parked ("den dagen, den sorgen"), not load-bearing now. Non-lawyer read — worth a real check
+    before it's load-bearing.
 - **Parser maintenance (minor).** The reader parses vBulletin HTML, so the parser needs updating
   when Flashback's markup changes — ordinary upkeep, not an existential dependency. The
   volume/rate-limit worry is largely dissolved by the data-flow design itself: cache-first (D1 SoT
