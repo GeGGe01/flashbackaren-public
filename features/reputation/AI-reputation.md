@@ -3,9 +3,18 @@ feature: reputation
 status: prototype
 major: v1
 fork: F0
+governs:
+  - src/worker.ts
+  - migrations/0001_init.sql
 ---
 
 # Reputation — agent contract
+
+> **v1-core slice (built 2026-09-05):** direct 0–5 half-star rating only, stored as
+> `score_halfsteps` 0–10; aggregate is the plain mean. Weighted criteria, templates, and the
+> activity component (`R = min(5, B + 0.1P)`) are deferred — the slice implements `B` only, so
+> Q1 stays open. The Worker implements this alongside member-index and anonymous-identity, so
+> `governs` overlaps on `src/worker.ts`.
 
 ## Invariants
 
