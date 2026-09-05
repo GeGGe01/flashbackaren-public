@@ -23,6 +23,10 @@ Host target is Cloudflare. Minimize external dependencies.
 Test whether a richer user-level reputation model produces more useful signal than a simple
 post-level +1 system.
 
+This repository is one prototype under the **Flashbackaren launch surface**. Flashback is the
+medium that gives prototypes meaning, not a fixed product direction — what the surface
+ultimately hosts is deliberately undecided at this stage.
+
 ## Goals
 
 - Rate users, not individual posts.
@@ -48,6 +52,8 @@ post-level +1 system.
 - Security boundaries should expose no more information than required.
 - Anonymous use remains possible even if verified-only features appear later.
 - Features should remain detachable and document their own identity before integration.
+- Moderation is minimal and operator-owned: directly-illegal content is removed and abuse is
+  monitored; nothing beyond that is curated.
 
 ## Current state
 
@@ -105,6 +111,7 @@ Candidate horizon only:
 ## Important constraints
 
 - Cloudflare host target.
+- Deploy surface: served at typ.gegge.se/flashbackaren (or similar) — CF work is alchemist's.
 - Minimize external dependencies.
 - TypeScript/Worker + React/Vite is the current preferred direction, not an immutable
   requirement.
