@@ -6,15 +6,21 @@ fork: F0
 governs:
   - src/worker.ts
   - migrations/0001_init.sql
+  - migrations/0003_rich_rating.sql
 ---
 
 # Reputation — agent contract
 
-> **v1-core slice (built 2026-09-05):** direct 0–5 half-star rating only, stored as
-> `score_halfsteps` 0–10; aggregate is the plain mean. Weighted criteria, templates, and the
-> activity component (`R = min(5, B + 0.1P)`) are deferred — the slice implements `B` only, so
-> Q1 stays open. The Worker implements this alongside member-index and anonymous-identity, so
-> `governs` overlaps on `src/worker.ts`.
+> **Built (2026-09-05):** both rating modes work. **Direct** — a 0–5 half-star score stored as
+> `score_halfsteps` 0–10. **Rich** — score several criteria from a template, each with a weight
+> (1–5); the stored overall score is the weighted mean of the criteria, and the per-criterion
+> breakdown is kept in `rating_criteria`. One built-in **Standard** template ships (Kunskap,
+> Humor, Hjälpsamhet, Kvalitet); ≤10 criteria enforced; the member aggregate is still the plain
+> mean of raters' overall scores, so direct and rich raters mix cleanly. Re-rating replaces the
+> rater's single row (and clears the old breakdown). Still deferred: the template ECOSYSTEM
+> (forking, immutable versions, Standard/Featured/Community tiers — a later horizon) and the
+> activity component (`R = min(5, B + 0.1P)`); Q1 stays open. The Worker implements this alongside
+> member-index and anonymous-identity, so `governs` overlaps on `src/worker.ts`.
 
 ## Invariants
 
