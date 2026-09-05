@@ -182,11 +182,12 @@ These are review notes on the vision above, kept distinct from Dexter's authored
   surface. That is a copyright / database-right / ToS question the auth boundary does not cover,
   and it concentrates at **V4, not V5**. It needs an explicit position (transformative/excerpt vs
   full render; attribution + canonical link back to the original).
-- **Scraping fragility + Flashback's own bot protection.** The reader depends on parsing
-  vBulletin HTML (brittle) fetched from Cloudflare Workers — and Flashback itself sits behind
-  Cloudflare with a WAF/Access posture (cf. the mcp-git inventory: Workers take no internal
-  shortcuts; public routes hit gates). Needs a position on what happens when Flashback
-  rate-limits/blocks, and how the parser survives markup changes.
+- **Scraping fragility + Flashback's own anti-bot posture.** The reader depends on parsing
+  vBulletin HTML (brittle) fetched from Cloudflare Workers. Flashback is served directly by nginx
+  (verified: `server: nginx`, no Cloudflare) — so it is NOT the CF-behind-CF case that git.gegge.me
+  is; but an nginx origin can still rate-limit or block by IP/UA, and vBulletin markup drifts.
+  Needs a position on what happens when Flashback rate-limits/blocks (Workers egress from shared
+  Cloudflare IPs), and how the parser survives markup changes.
 - **The harassment surface scales at V4.** A per-user community score shown *inline on every post*
   is a far stronger pile-on / reputation-attack vector than an opt-in rating page. The
   "remove-illegal-only" moderation stance that fits V1 deserves a re-look before V4 (opt-out,
