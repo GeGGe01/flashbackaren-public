@@ -182,12 +182,14 @@ These are review notes on the vision above, kept distinct from Dexter's authored
   surface. That is a copyright / database-right / ToS question the auth boundary does not cover,
   and it concentrates at **V4, not V5**. It needs an explicit position (transformative/excerpt vs
   full render; attribution + canonical link back to the original).
-- **Scraping fragility + Flashback's own anti-bot posture.** The reader depends on parsing
-  vBulletin HTML (brittle) fetched from Cloudflare Workers. Flashback is served directly by nginx
-  (verified: `server: nginx`, no Cloudflare) — so it is NOT the CF-behind-CF case that git.gegge.me
-  is; but an nginx origin can still rate-limit or block by IP/UA, and vBulletin markup drifts.
-  Needs a position on what happens when Flashback rate-limits/blocks (Workers egress from shared
-  Cloudflare IPs), and how the parser survives markup changes.
+- **Parser maintenance (minor).** The reader parses vBulletin HTML, so the parser needs updating
+  when Flashback's markup changes — ordinary upkeep, not an existential dependency. The
+  volume/rate-limit worry is largely dissolved by the data-flow design itself: cache-first (D1 SoT
+  + KV), background indexing that makes the system progressively less on-demand-dependent, and
+  conservative per-endpoint budgets — the architecture exists precisely to keep upstream requests
+  low. (Flashback is a plain nginx origin — verified `server: nginx`, no Cloudflare — so there is
+  no WAF/CF-behind-CF complication either.) Downgraded from an earlier overstated "scraping
+  fragility" flag.
 - **The harassment surface scales at V4.** A per-user community score shown *inline on every post*
   is a far stronger pile-on / reputation-attack vector than an opt-in rating page. The
   "remove-illegal-only" moderation stance that fits V1 deserves a re-look before V4 (opt-out,
