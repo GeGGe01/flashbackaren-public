@@ -46,12 +46,17 @@ async function resolveMemberUpstream(
     const tm = phtml.match(/Visa profil:\s*([^<]+)</);
     const username = (tm ? decodeEntities(tm[1]) : q).trim();
     if (!username) return null;
+    // Reg date IS on the public profile ("Reg: <strong>YYYY-MM-DD</strong>"); post count is NOT
+    // (that's only on the gated memberlist), so on-miss captures every public fact but not posts.
+    const rm = phtml.match(/Reg:\s*<strong>(\d{4}-\d{2}-\d{2})<\/strong>/);
+    const regDate = rm ? rm[1] : null;
     const now = new Date().toISOString();
     await env.DB.prepare(
-      `INSERT INTO members (uid, username, first_seen, last_seen) VALUES (?1, ?2, ?3, ?3)
-       ON CONFLICT (uid) DO UPDATE SET username = excluded.username, last_seen = excluded.last_seen`,
+      `INSERT INTO members (uid, username, first_seen, last_seen, reg_date) VALUES (?1, ?2, ?3, ?3, ?4)
+       ON CONFLICT (uid) DO UPDATE SET username = excluded.username, last_seen = excluded.last_seen,
+         reg_date = COALESCE(members.reg_date, excluded.reg_date)`,
     )
-      .bind(uid, username, now)
+      .bind(uid, username, now, regDate)
       .run();
     return { uid, username, avg_hs: null, cnt: 0 };
   } catch {

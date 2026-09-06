@@ -38,7 +38,17 @@ governs:
 > This realises the "miss → lookup → cache" path entirely within the public/trust-domain boundary
 > (no session). Verified: "Webbvavaren" (not preseeded) resolved to uid 1792136 and cached. The
 > upstream call currently rides the interactive request; it should move behind the request
-> budget/queue later.
+> budget/queue later. On-miss also captures the public **reg date** (`Reg: <strong>…</strong>`);
+> the **post count is NOT on the public profile** (only the gated memberlist), so posts stay a
+> separate operator-export pipeline.
+>
+> **Resilience risk (2026-09-06):** the `p:` resolver is public (verified in incognito) but
+> Flashback now knows about it (the entry was found by trial-and-error and posted in a thread), so
+> it may be closed in future. Hedge: keep caching every resolved member (organic use already does),
+> and — if broader coverage is wanted before any closure — a **paced** background crawl of PUBLIC
+> **thread** pages (each post author is a `/uNNN` link, independent of `p:`) is the robust
+> index-building source. Keep it paced: an aggressive burst could invite a faster shutdown. Post
+> counts remain gated regardless, refreshed via operator memberlist exports.
 
 ## Invariants
 
