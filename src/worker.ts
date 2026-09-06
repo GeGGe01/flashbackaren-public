@@ -19,6 +19,7 @@ interface D1PreparedStatement {
 }
 interface D1Database {
   prepare(query: string): D1PreparedStatement;
+  batch(statements: D1PreparedStatement[]): Promise<unknown>; // atomic multi-statement write
 }
 interface Env {
   DB: D1Database;
@@ -329,30 +330,28 @@ export default {
           finalHs = hs;
         }
 
-        await env.DB.prepare(
-          `INSERT INTO ratings (rater_meta_id, target_uid, score_halfsteps, updated_at, mode, template_id, comment)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
-           ON CONFLICT (rater_meta_id, target_uid) DO UPDATE SET
-             score_halfsteps = excluded.score_halfsteps, updated_at = excluded.updated_at,
-             mode = excluded.mode, template_id = excluded.template_id, comment = excluded.comment`,
-        )
-          .bind(meta, uid, finalHs, now, mode, templateId, comment)
-          .run();
-
-        // Replace any prior per-criterion breakdown for this (rater, target).
-        await env.DB.prepare(
-          `DELETE FROM rating_criteria WHERE rater_meta_id = ?1 AND target_uid = ?2`,
-        )
-          .bind(meta, uid)
-          .run();
-        for (const r of rows) {
-          await env.DB.prepare(
-            `INSERT INTO rating_criteria (rater_meta_id, target_uid, criterion_id, score_halfsteps, weight)
-               VALUES (?1, ?2, ?3, ?4, ?5)`,
-          )
-            .bind(meta, uid, r.criterion_id, r.halfsteps, r.weight)
-            .run();
-        }
+        // Write the overall rating and its per-criterion breakdown as ONE atomic unit, so the
+        // stored score can never desync from its breakdown on a mid-way failure (D1 batch = one
+        // transaction). Order: upsert rating → clear old breakdown → insert new breakdown rows.
+        const writes: D1PreparedStatement[] = [
+          env.DB.prepare(
+            `INSERT INTO ratings (rater_meta_id, target_uid, score_halfsteps, updated_at, mode, template_id, comment)
+               VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+             ON CONFLICT (rater_meta_id, target_uid) DO UPDATE SET
+               score_halfsteps = excluded.score_halfsteps, updated_at = excluded.updated_at,
+               mode = excluded.mode, template_id = excluded.template_id, comment = excluded.comment`,
+          ).bind(meta, uid, finalHs, now, mode, templateId, comment),
+          env.DB.prepare(
+            `DELETE FROM rating_criteria WHERE rater_meta_id = ?1 AND target_uid = ?2`,
+          ).bind(meta, uid),
+          ...rows.map((r) =>
+            env.DB.prepare(
+              `INSERT INTO rating_criteria (rater_meta_id, target_uid, criterion_id, score_halfsteps, weight)
+                 VALUES (?1, ?2, ?3, ?4, ?5)`,
+            ).bind(meta, uid, r.criterion_id, r.halfsteps, r.weight),
+          ),
+        ];
+        await env.DB.batch(writes);
 
         const agg = await env.DB.prepare(
           `SELECT AVG(score_halfsteps) AS avg_hs, COUNT(*) AS cnt FROM ratings WHERE target_uid = ?1`,
