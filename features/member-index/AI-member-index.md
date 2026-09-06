@@ -23,6 +23,12 @@ governs:
 > (moderators=iso-8859-1, memberlist=utf-8, mojibake=0) and by fixtures in `src/flashback.test.ts`.
 > Members carry a `source_url` (canonical profile URL) for debuggability. The adapter is meant to be
 > reused later by thread search, batch jobs, and companion features.
+>
+> **Honest User-Agent (operator decision, 2026-09-06):** every normalizer fetch sends an
+> identifying UA with a native contact channel so Flashback can attribute our traffic and reach the
+> operator directly if anything pushes too hard — rather than blanket-blocking an anonymous scraper.
+> Contact = a Flashback PM link to the operator's account (The Crash, u135422). Good-neighbour
+> transparency, consistent with the conservative upstream budget; the future crawler inherits it.
 
 > **Real cold-boot preseed (built 2026-09-06):** `POST /api/preseed/moderators` fetches
 > Flashback's **public** moderators page, decodes it (ISO-8859-1), parses `/uNNN` + username, and
