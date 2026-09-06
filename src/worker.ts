@@ -23,6 +23,7 @@ interface D1Database {
 }
 interface Env {
   DB: D1Database;
+  ADMIN_SECRET?: string; // server-side secret gating the preseed/import endpoints (wrangler secret / .dev.vars)
 }
 
 const COOKIE = 'fb_meta';
@@ -50,30 +51,35 @@ async function upsertMember(
 
 // Resolve an exact username via Flashback's PUBLIC member search: sok/?query=p:<name> 302-redirects
 // to the profile /uNNN on an exact match. Bytes cross the normalizer; we parse UTF-8 facts only.
-// Returns null on no exact match or any upstream hiccup.
-async function resolveMemberUpstream(
-  q: string,
-  env: Env,
-): Promise<{ uid: string; username: string; avg_hs: number | null; cnt: number } | null> {
+// Distinguishes NOT_FOUND (no exact match) from ERROR (upstream/rate-limit/parse failure) internally,
+// so an error is never cached as a miss; the external API response stays minimal regardless.
+type MemberRow = { uid: string; username: string; avg_hs: number | null; cnt: number };
+type ResolveResult = { status: 'found'; member: MemberRow } | { status: 'not_found' } | { status: 'error' };
+async function resolveMemberUpstream(q: string, env: Env): Promise<ResolveResult> {
+  let search;
   try {
-    const search = await fetchFlashback(
+    search = await fetchFlashback(
       'https://www.flashback.org/sok/?query=' + encodeURIComponent('p:' + q),
       { redirect: 'manual' },
     );
-    const um = (search.location ?? '').match(/\/u(\d+)/);
-    if (!um) return null;
-    const uid = um[1];
+  } catch {
+    return { status: 'error' };
+  }
+  const um = (search.location ?? '').match(/\/u(\d+)/);
+  if (!um) return { status: 'not_found' }; // no exact-match redirect = genuinely not found
+  const uid = um[1];
+  try {
     const profileUrl = 'https://www.flashback.org/u' + uid;
     const profile = await fetchFlashback(profileUrl);
     const tm = profile.html.match(/Visa profil:\s*([^<]+)</);
     const username = (tm ? decodeEntities(tm[1]) : q).trim();
-    if (!username) return null;
+    if (!username) return { status: 'error' }; // redirected to a profile we couldn't parse
     // Reg date is in the static profile HTML; post count is public but JS-rendered (not here).
     const rm = profile.html.match(/Reg:\s*<strong>(\d{4}-\d{2}-\d{2})<\/strong>/);
     await upsertMember(env, { uid, username, regDate: rm ? rm[1] : null, sourceUrl: profileUrl });
-    return { uid, username, avg_hs: null, cnt: 0 };
+    return { status: 'found', member: { uid, username, avg_hs: null, cnt: 0 } };
   } catch {
-    return null;
+    return { status: 'error' };
   }
 }
 
@@ -85,6 +91,26 @@ function readMeta(request: Request): string | null {
 
 function json(body: unknown, extraHeaders?: Record<string, string>): Response {
   return new Response(JSON.stringify(body), {
+    headers: { 'Content-Type': 'application/json', ...(extraHeaders ?? {}) },
+  });
+}
+
+// The preseed/import endpoints write to D1 (the memberlist import can inject arbitrary member facts),
+// so they must never be publicly writable: require a server-side secret via constant-time compare.
+// Deny outright if ADMIN_SECRET isn't configured (fail closed).
+function timingSafeEqual(a: string, b: string): boolean {
+  if (a.length !== b.length) return false;
+  let diff = 0;
+  for (let i = 0; i < a.length; i++) diff |= a.charCodeAt(i) ^ b.charCodeAt(i);
+  return diff === 0;
+}
+function isAdmin(request: Request, env: Env): boolean {
+  const provided = request.headers.get('X-Admin-Secret');
+  return !!env.ADMIN_SECRET && !!provided && timingSafeEqual(provided, env.ADMIN_SECRET);
+}
+function forbidden(extraHeaders?: Record<string, string>): Response {
+  return new Response(JSON.stringify({ error: 'forbidden' }), {
+    status: 403,
     headers: { 'Content-Type': 'application/json', ...(extraHeaders ?? {}) },
   });
 }
@@ -139,8 +165,10 @@ export default {
     let setCookie: Record<string, string> | undefined;
     if (!meta) {
       meta = crypto.randomUUID();
+      // Secure over HTTPS (production / workers.dev); omitted on local http dev so the cookie still sets.
+      const secure = url.protocol === 'https:' ? '; Secure' : '';
       setCookie = {
-        'Set-Cookie': `${COOKIE}=${meta}; Path=/; Max-Age=${TEN_YEARS}; SameSite=Lax; HttpOnly`,
+        'Set-Cookie': `${COOKIE}=${meta}; Path=/; Max-Age=${TEN_YEARS}; SameSite=Lax; HttpOnly${secure}`,
       };
     }
 
@@ -163,9 +191,11 @@ export default {
           .all<{ uid: string; username: string; avg_hs: number | null; cnt: number }>();
         let list = rows.results;
         // Cache-first: on a genuine miss, resolve one exact username upstream (public search) and cache it.
-        if (list.length === 0 && q.length >= 2 && /^[\wåäöÅÄÖ .-]+$/.test(q)) {
-          const found = await resolveMemberUpstream(q, env);
-          if (found) list = [found];
+        // Username is OPAQUE upstream data (legacy names break any allowlist), so we only bound length
+        // and reject control chars; the query is URL-encoded in resolveMemberUpstream.
+        if (list.length === 0 && q.length >= 2 && q.length <= 60 && !/[\x00-\x1f\x7f]/.test(q)) {
+          const res = await resolveMemberUpstream(q, env);
+          if (res.status === 'found') list = [res.member];
         }
         return json(
           list.map((m) => ({
@@ -375,6 +405,7 @@ export default {
       // trust-domain boundary and is deliberately NOT fetched here.) Later this becomes a background
       // job; for now it's an explicit trigger so the fetch/parse pipeline can be run and verified.
       if (path === '/api/preseed/moderators' && request.method === 'POST') {
+        if (!isAdmin(request, env)) return forbidden(setCookie);
         const page = await fetchFlashback('https://www.flashback.org/moderatorer');
         if (!page.ok) return json({ error: 'upstream', status: page.status }, setCookie);
         const re = /href="\/u(\d+)"\s+class="bold">([^<]+)<\/a>/g;
@@ -397,6 +428,7 @@ export default {
       // fetch happens on the human's side (we hold no session); we only parse FACTS (UID, username,
       // reg date, post count) out of the posted HTML and drop everything else (avatars etc.).
       if (path === '/api/preseed/memberlist' && request.method === 'POST') {
+        if (!isAdmin(request, env)) return forbidden(setCookie);
         // The operator uploads saved memberlist HTML; the normalizer yields canonical UTF-8
         // regardless of whether the browser saved it as UTF-8 (with a stale ISO-8859-1 meta).
         const page = normalizeBytes(

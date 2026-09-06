@@ -75,6 +75,12 @@ governs:
 
 ## Invariants
 
+- **Preseed/import endpoints (`/api/preseed/*`) require a server-side admin secret** (`ADMIN_SECRET`,
+  fail-closed) — never publicly writable, or the memberlist import could inject fabricated facts.
+- **Username is opaque upstream data** — no allowlist/regex; only bound length + reject control chars,
+  URL-encode when querying. (Legacy names break any allowlist.)
+- `resolveMemberUpstream` distinguishes NOT_FOUND from ERROR internally (an error is never cached as
+  a miss); the external response stays minimal.
 - Flashback UID is canonical member identity.
 - Username is presentation/search data.
 - Store upstream username exactly as returned.
