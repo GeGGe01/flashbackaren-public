@@ -71,6 +71,15 @@ export const FRONT_HTML = /* html */ `<!doctype html>
   .wlab { font-size:12px; color:var(--muted); white-space:nowrap; }
   .wlab select { margin-left:4px; }
   #rich-final { color:var(--star); }
+  .cbox { margin-top:12px; }
+  .cbox textarea { width:100%; padding:8px 10px; border:1px solid var(--frame); font:14px var(--sans); resize:vertical; }
+  .ccount { font-size:11px; color:var(--muted); margin-top:3px; }
+  .ccount.over { color:var(--red); font-weight:700; }
+  .reviews { margin-top:16px; border-top:1px solid var(--frame); padding-top:10px; }
+  .rev-h { font-weight:700; font-size:13px; margin:0 0 8px; }
+  .rev { display:flex; gap:10px; padding:6px 0; border-bottom:1px solid var(--row2); font-size:14px; }
+  .rev-stars { color:var(--star); font-weight:700; white-space:nowrap; }
+  .rev-text { color:var(--fg); }
 </style>
 </head>
 <body>
@@ -124,6 +133,29 @@ function repLine(p){
 }
 function afterRate(state){ openProfile(state.uid); search($('#q').value); }
 
+function commentFieldHtml(pre){
+  return '<div class="cbox"><textarea id="comment" maxlength="420" rows="2" ' +
+    'placeholder="Omdöme (valfritt) — max 420 tecken / 88 ord">' + (pre ? esc(pre) : '') + '</textarea>' +
+    '<div class="ccount" id="ccount"></div></div>';
+}
+function getComment(){ const el = $('#comment'); return el ? el.value : ''; }
+function wireComment(){
+  const el = $('#comment'), c = $('#ccount'); if(!el) return;
+  const upd = () => {
+    const s = el.value.trim();
+    const words = s ? s.split(/\s+/).filter(Boolean).length : 0;
+    c.textContent = el.value.length + '/420 tecken · ' + words + '/88 ord';
+    c.classList.toggle('over', el.value.length > 420 || words > 88);
+  };
+  el.oninput = upd; upd();
+}
+function reviewsHtml(reviews){
+  if (!reviews || !reviews.length) return '';
+  return '<div class="reviews"><p class="rev-h">Omdömen</p>' +
+    reviews.map(r => '<div class="rev"><span class="rev-stars">★ ' + (r.stars==null?'–':r.stars) +
+      '</span><span class="rev-text">' + esc(r.text) + '</span></div>').join('') + '</div>';
+}
+
 async function openProfile(uid) {
   const p = await (await fetch('/api/profile?uid=' + encodeURIComponent(uid))).json();
   if (p.error) return;
@@ -135,7 +167,8 @@ async function openProfile(uid) {
       '<button class="mode" data-m="rich">Kriterier</button></div>' +
     '<div id="rate-area"></div>' +
     '<div class="rate-row"><button class="ghost" id="close">Stäng</button>' +
-      '<span class="muted" id="note">' + (p.yourHalfsteps==null ? 'Du har inte betygsatt än.' : 'Ditt betyg.') + '</span></div>';
+      '<span class="muted" id="note">' + (p.yourHalfsteps==null ? 'Du har inte betygsatt än.' : 'Ditt betyg.') + '</span></div>' +
+    reviewsHtml(p.reviews);
   const state = { uid, p };
   const modeBtns = profile.querySelectorAll('.mode');
   function selectMode(m){
@@ -152,13 +185,15 @@ function renderDirect(state){
   $('#rate-area').innerHTML =
     '<div class="rate-row"><input type="range" id="slider" min="0" max="10" step="1" value="' + hs + '">' +
       '<span class="yourval" id="yourval">' + (hs/2).toFixed(1) + ' ★</span>' +
-      '<button id="submit">Betygsätt</button></div>';
+      '<button id="submit">Betygsätt</button></div>' + commentFieldHtml(state.p.yourComment);
   const slider = $('#slider'), yv = $('#yourval');
   slider.oninput = () => { yv.textContent = (slider.value/2).toFixed(1) + ' ★'; };
+  wireComment();
   $('#submit').onclick = async () => {
     const d = await (await fetch('/api/rate', { method:'POST', headers:{'Content-Type':'application/json'},
-      body: JSON.stringify({ uid: state.uid, mode:'direct', halfsteps: Number(slider.value) }) })).json();
+      body: JSON.stringify({ uid: state.uid, mode:'direct', halfsteps: Number(slider.value), comment: getComment() }) })).json();
     if (d.ok) afterRate(state);
+    else if (d.error === 'comment_too_long') $('#note').textContent = 'Omdömet är för långt (max 420 tecken / 88 ord).';
   };
 }
 
@@ -177,7 +212,7 @@ async function renderRich(state){
   }).join('');
   $('#rate-area').innerHTML = '<p class="tpl-name">Mall: '+esc(tpl.name)+' · viktat snitt</p>' + rowsHtml +
     '<div class="rate-row"><strong>Blir <span id="rich-final">–</span></strong>' +
-      '<button id="submit">Betygsätt</button></div>';
+      '<button id="submit">Betygsätt</button></div>' + commentFieldHtml(state.p.yourComment);
   const crits = () => [...profile.querySelectorAll('.crit')].map(el => ({
     criterion_id: el.dataset.cid,
     halfsteps: Number(el.querySelector('.c-score').value),
@@ -195,10 +230,12 @@ async function renderRich(state){
   }
   profile.querySelectorAll('.c-score, .c-weight').forEach(i => { i.oninput = recompute; i.onchange = recompute; });
   recompute();
+  wireComment();
   $('#submit').onclick = async () => {
     const d = await (await fetch('/api/rate', { method:'POST', headers:{'Content-Type':'application/json'},
-      body: JSON.stringify({ uid: state.uid, mode:'rich', template_id: tpl.id, criteria: crits() }) })).json();
+      body: JSON.stringify({ uid: state.uid, mode:'rich', template_id: tpl.id, criteria: crits(), comment: getComment() }) })).json();
     if (d.ok) afterRate(state);
+    else if (d.error === 'comment_too_long') $('#note').textContent = 'Omdömet är för långt (max 420 tecken / 88 ord).';
   };
 }
 

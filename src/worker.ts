@@ -103,6 +103,19 @@ function postsPerDay(posts: number | null | undefined, regDate: string | null | 
 const ACTIVITY_WEIGHT = 0.1; // the 0.1 in R = min(5, B + 0.1·P); operator-tunable (Q1)
 const r1 = (n: number) => Math.round(n * 10) / 10;
 
+const COMMENT_MAX_CHARS = 420;
+const COMMENT_MAX_WORDS = 88;
+// Normalise an optional free-text review: null when empty, the trimmed text when valid, or false
+// when it breaks a hard limit (≤420 chars AND ≤88 words).
+function cleanComment(raw: unknown): string | null | false {
+  if (raw == null) return null;
+  const s = String(raw).trim();
+  if (s === '') return null;
+  if (s.length > COMMENT_MAX_CHARS) return false;
+  if (s.split(/\s+/).filter(Boolean).length > COMMENT_MAX_WORDS) return false;
+  return s;
+}
+
 // Flashback serves ISO-8859-1; decode a small set of HTML entities left in usernames.
 function decodeEntities(s: string): string {
   const named: Record<string, string> = {
@@ -193,10 +206,18 @@ export default {
           .bind(uid)
           .first<{ avg_hs: number | null; cnt: number }>();
         const mine = await env.DB.prepare(
-          `SELECT score_halfsteps AS hs, mode, template_id FROM ratings WHERE rater_meta_id = ?1 AND target_uid = ?2`,
+          `SELECT score_halfsteps AS hs, mode, template_id, comment FROM ratings WHERE rater_meta_id = ?1 AND target_uid = ?2`,
         )
           .bind(meta, uid)
-          .first<{ hs: number; mode: string; template_id: string | null }>();
+          .first<{ hs: number; mode: string; template_id: string | null; comment: string | null }>();
+        // Sampled reviews shown on the profile. Q6 (sampling policy) is open — v1 uses recency.
+        const reviews = await env.DB.prepare(
+          `SELECT comment, score_halfsteps AS hs FROM ratings
+             WHERE target_uid = ?1 AND comment IS NOT NULL AND comment != ''
+             ORDER BY updated_at DESC LIMIT 5`,
+        )
+          .bind(uid)
+          .all<{ comment: string; hs: number }>();
         let yourCriteria: { criterion_id: string; halfsteps: number; weight: number }[] = [];
         if (mine?.mode === 'rich') {
           const rc = await env.DB.prepare(
@@ -227,7 +248,9 @@ export default {
             count: agg?.cnt ?? 0,
             yourHalfsteps: mine?.hs ?? null,
             yourMode: mine?.mode ?? null,
+            yourComment: mine?.comment ?? null,
             yourCriteria,
+            reviews: reviews.results.map((r) => ({ text: r.comment, stars: toStars(r.hs) })),
           },
           setCookie,
         );
@@ -243,9 +266,12 @@ export default {
           halfsteps?: number;
           template_id?: string;
           criteria?: { criterion_id: string; halfsteps: number; weight: number }[];
+          comment?: string;
         };
         const uid = (body.uid ?? '').trim();
         if (!uid) return json({ error: 'bad_request' }, setCookie);
+        const comment = cleanComment(body.comment);
+        if (comment === false) return json({ error: 'comment_too_long' }, setCookie);
         const member = await env.DB.prepare(`SELECT uid FROM members WHERE uid = ?1`)
           .bind(uid)
           .first();
@@ -304,13 +330,13 @@ export default {
         }
 
         await env.DB.prepare(
-          `INSERT INTO ratings (rater_meta_id, target_uid, score_halfsteps, updated_at, mode, template_id)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+          `INSERT INTO ratings (rater_meta_id, target_uid, score_halfsteps, updated_at, mode, template_id, comment)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
            ON CONFLICT (rater_meta_id, target_uid) DO UPDATE SET
              score_halfsteps = excluded.score_halfsteps, updated_at = excluded.updated_at,
-             mode = excluded.mode, template_id = excluded.template_id`,
+             mode = excluded.mode, template_id = excluded.template_id, comment = excluded.comment`,
         )
-          .bind(meta, uid, finalHs, now, mode, templateId)
+          .bind(meta, uid, finalHs, now, mode, templateId, comment)
           .run();
 
         // Replace any prior per-criterion breakdown for this (rater, target).
