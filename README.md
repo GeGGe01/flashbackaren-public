@@ -15,18 +15,25 @@ Agents must read [AGENTS.md](./AGENTS.md) before implementation.
 
 Feature documentation lives under [features/](./features/).
 
-## Run the v1-core slice locally
+## Run V1 locally
 
-The minimum coherent surface — find a member → rate them (0–5, half-star) → see the aggregate.
-Runs fully local (Cloudflare Worker + D1 emulated by wrangler); no Cloudflare account needed.
+The reputation prototype — find a member → rate them (direct 0–5 half-star, or rich multi-criteria)
+→ see reputation `R = min(5, B + 0.1·P)` with the breakdown, plus optional free-text reviews. Runs
+fully local (Cloudflare Worker + D1 emulated by wrangler); no Cloudflare account needed.
 
 ```sh
 npm install
-npm run db:migrate:local   # creates the local D1 and seeds synthetic demo members
+npm run db:migrate:local   # creates the local D1 and seeds a few synthetic demo members
 npm run dev                # wrangler dev on http://localhost:8787
 ```
 
-Open http://localhost:8787, search `demo`, pick a member, drag the slider, and rate.
+Real members are indexed via `POST /api/preseed/moderators` (public moderators page) and
+`POST /api/preseed/memberlist` (operator-exported memberlist HTML); any exact username also resolves
+on demand via Flashback's public member search. All ingestion is facts-only (UID, username, reg date,
+post count) through the FlashbackNormalizer — no content stored. Search a real handle (e.g. `The Crash`)
+and rate them.
 
-Note: v1 is intentionally trivial to game (no anti-abuse hardening) and rates only synthetic
-demo members. See [PoAG.md](./PoAG.md) for the deliberate scope and what is deferred.
+Note: V1 is **intentionally trivial to game** (no anti-abuse hardening yet) — the point of the first
+surface is to feel the reputation model with honest users. See [PoAG.md](./PoAG.md) and
+[docs-review/REVIEW-2026-09-06.md](./docs-review/REVIEW-2026-09-06.md) for scope, the reconciled
+open-question ledger, and the next-phase plan.
