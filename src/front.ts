@@ -49,6 +49,8 @@ export const FRONT_HTML = /* html */ `<!doctype html>
   .card h2 { margin:0 0 2px; font-size:18px; font-weight:700; color:var(--fg); }
   .agg { font-size:30px; color:var(--star); font-weight:700; font-variant-numeric:tabular-nums; }
   .agg .count { font-size:13px; font-weight:400; }
+  .agg .brk { display:block; font-size:12px; font-weight:400; color:var(--muted); margin-top:2px; }
+  .agg .none { color:var(--muted); font-size:18px; font-weight:400; }
   .rate-row { display:flex; align-items:center; gap:1rem; margin-top:14px; }
   input[type=range] { flex:1; accent-color:var(--primary); }
   .yourval { min-width:3.5rem; text-align:right; font-variant-numeric:tabular-nums; }
@@ -110,8 +112,17 @@ async function search(q) {
 
 let TEMPLATE = null;
 async function getTemplate(){ if(!TEMPLATE) TEMPLATE = await (await fetch('/api/template')).json(); return TEMPLATE; }
-function fmtAgg(stars, count){ return (stars == null ? '–' : '★ ' + stars) + '<span class="count"> (' + count + ' röster)</span>'; }
-function afterRate(d){ $('#agg').innerHTML = fmtAgg(d.stars, d.count); $('#note').textContent = 'Ditt betyg sparat.'; search($('#q').value); }
+function repLine(p){
+  if (p.reputation == null) {
+    const act = p.postsPerDay == null ? '' : ' · ' + p.postsPerDay + ' inlägg/dag';
+    return '<span class="none">Inga betyg än</span><span class="count">' + act + '</span>';
+  }
+  const brk = p.postsPerDay == null ? ''
+    : '<span class="brk">community ' + p.community + ' + aktivitet ' + p.activityBonus +
+      ' · ' + p.postsPerDay + ' inlägg/dag</span>';
+  return '★ ' + p.reputation + '<span class="count"> (' + p.count + ' röster)</span>' + brk;
+}
+function afterRate(state){ openProfile(state.uid); search($('#q').value); }
 
 async function openProfile(uid) {
   const p = await (await fetch('/api/profile?uid=' + encodeURIComponent(uid))).json();
@@ -119,7 +130,7 @@ async function openProfile(uid) {
   profile.hidden = false;
   profile.innerHTML =
     '<h2>' + esc(p.username) + '</h2>' +
-    '<div class="agg" id="agg">' + fmtAgg(p.stars, p.count) + '</div>' +
+    '<div class="agg" id="agg">' + repLine(p) + '</div>' +
     '<div class="modes"><button class="mode" data-m="direct">Direkt</button>' +
       '<button class="mode" data-m="rich">Kriterier</button></div>' +
     '<div id="rate-area"></div>' +
@@ -147,7 +158,7 @@ function renderDirect(state){
   $('#submit').onclick = async () => {
     const d = await (await fetch('/api/rate', { method:'POST', headers:{'Content-Type':'application/json'},
       body: JSON.stringify({ uid: state.uid, mode:'direct', halfsteps: Number(slider.value) }) })).json();
-    if (d.ok) afterRate(d);
+    if (d.ok) afterRate(state);
   };
 }
 
@@ -187,7 +198,7 @@ async function renderRich(state){
   $('#submit').onclick = async () => {
     const d = await (await fetch('/api/rate', { method:'POST', headers:{'Content-Type':'application/json'},
       body: JSON.stringify({ uid: state.uid, mode:'rich', template_id: tpl.id, criteria: crits() }) })).json();
-    if (d.ok) afterRate(d);
+    if (d.ok) afterRate(state);
   };
 }
 

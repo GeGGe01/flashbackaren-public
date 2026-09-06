@@ -17,9 +17,21 @@ governs:
 > breakdown is kept in `rating_criteria`. One built-in **Standard** template ships (Kunskap,
 > Humor, Hjälpsamhet, Kvalitet); ≤10 criteria enforced; the member aggregate is still the plain
 > mean of raters' overall scores, so direct and rich raters mix cleanly. Re-rating replaces the
-> rater's single row (and clears the old breakdown). Still deferred: the template ECOSYSTEM
-> (forking, immutable versions, Standard/Featured/Community tiers — a later horizon) and the
-> activity component (`R = min(5, B + 0.1P)`); Q1 stays open. The Worker implements this alongside
+> rater's single row (and clears the old breakdown).
+>
+> **Activity component (built 2026-09-06, Q1):** the profile now shows reputation
+> `R = min(5, B + 0.1·P)`, where B is the community mean and P = posts / account-age-days (from the
+> stored posts + reg_date). Activity is a SEPARATE, small bump — not quality — and only applies when
+> there IS a community rating (an unrated member shows "no rating yet", never a reputation
+> synthesised from activity alone). The breakdown is shown transparently (community + activity ·
+> posts/day) so it's independently inspectable. The `0.1` weight (`ACTIVITY_WEIGHT`) is
+> operator-tunable — Q1's formula/threshold remains the operator's to finalise. Verified: The Crash
+> 4.0 + 0.2 = 4.2; micro113 (15.4 posts/day) caps at 5.0; unrated member → null. Members without a
+> post count (e.g. moderators-only, or on-miss-resolved) get B with no bump. NOTE: the search LIST
+> still shows community B; the profile shows full R.
+>
+> Still deferred: the template ECOSYSTEM (forking, immutable versions, Standard/Featured/Community
+> tiers — a later horizon). The Worker implements this alongside
 > member-index and anonymous-identity, so `governs` overlaps on `src/worker.ts`.
 
 ## Invariants

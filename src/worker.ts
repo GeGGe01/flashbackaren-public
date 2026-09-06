@@ -93,6 +93,16 @@ function toStars(avgHalfsteps: number | null): number | null {
   return avgHalfsteps == null ? null : Math.round((avgHalfsteps / 2) * 10) / 10;
 }
 
+// Activity: posts per day = posts / account age in days. Separate from quality — it only ever adds
+// a small bump (0.1·P) on top of the community rating B, capped at 5 (Q1). Null when we lack posts/reg.
+function postsPerDay(posts: number | null | undefined, regDate: string | null | undefined): number | null {
+  if (posts == null || !regDate) return null;
+  const days = Math.max(1, Math.floor((Date.now() - Date.parse(regDate)) / 86400000));
+  return posts / days;
+}
+const ACTIVITY_WEIGHT = 0.1; // the 0.1 in R = min(5, B + 0.1·P); operator-tunable (Q1)
+const r1 = (n: number) => Math.round(n * 10) / 10;
+
 // Flashback serves ISO-8859-1; decode a small set of HTML entities left in usernames.
 function decodeEntities(s: string): string {
   const named: Record<string, string> = {
@@ -171,9 +181,11 @@ export default {
       // --- See: one member's aggregate + this browser's current rating (with rich breakdown).
       if (path === '/api/profile' && request.method === 'GET') {
         const uid = (url.searchParams.get('uid') ?? '').trim();
-        const member = await env.DB.prepare(`SELECT uid, username FROM members WHERE uid = ?1`)
+        const member = await env.DB.prepare(
+          `SELECT uid, username, posts, reg_date FROM members WHERE uid = ?1`,
+        )
           .bind(uid)
-          .first<{ uid: string; username: string }>();
+          .first<{ uid: string; username: string; posts: number | null; reg_date: string | null }>();
         if (!member) return json({ error: 'not_found' }, setCookie);
         const agg = await env.DB.prepare(
           `SELECT AVG(score_halfsteps) AS avg_hs, COUNT(*) AS cnt FROM ratings WHERE target_uid = ?1`,
@@ -195,11 +207,23 @@ export default {
             .all<{ criterion_id: string; halfsteps: number; weight: number }>();
           yourCriteria = rc.results;
         }
+        // Reputation R = min(5, B + 0.1·P): community rating B plus a small activity bump. Activity
+        // is a SEPARATE component (not quality) and only applies when there's a community rating.
+        const community = toStars(agg?.avg_hs ?? null); // B, or null when unrated
+        const p = postsPerDay(member.posts, member.reg_date);
+        const activityBonus = p == null ? 0 : r1(ACTIVITY_WEIGHT * p);
+        const reputation =
+          community == null ? null : r1(Math.min(5, community + ACTIVITY_WEIGHT * (p ?? 0)));
         return json(
           {
             uid: member.uid,
             username: member.username,
-            stars: toStars(agg?.avg_hs ?? null),
+            community,
+            postsPerDay: p == null ? null : r1(p),
+            activityBonus,
+            reputation,
+            posts: member.posts,
+            regDate: member.reg_date,
             count: agg?.cnt ?? 0,
             yourHalfsteps: mine?.hs ?? null,
             yourMode: mine?.mode ?? null,
