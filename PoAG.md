@@ -54,6 +54,12 @@ ultimately hosts is deliberately undecided at this stage.
 - Features should remain detachable and document their own identity before integration.
 - Moderation is minimal and operator-owned: directly-illegal content is removed and abuse is
   monitored; nothing beyond that is curated.
+- Trust-domain separation (north star): public Flashback data may be fetched/indexed/rendered by
+  us; anything needing an authenticated Flashback session is a bridge-out to the original. We never
+  hold Flashback passwords/cookies/sessions or a shared Flashback account. See [COMPANION-READER.md](./COMPANION-READER.md).
+- Flashback = upstream content/source; Flashbackaren = identity + reputation + curation +
+  interaction + presentation. V1's anonymous meta-identity is the embryo of Flashbackaren's own
+  user identity, not a workaround.
 
 ## Current state
 
@@ -81,6 +87,11 @@ Deliberate scope of this slice:
 - Deploy is deferred with the rest of the CF infrastructure (alchemist); the slice runs local.
 
 ## Roadmap
+
+The full V1–V5 capability horizons — culminating in the **Companion Reader** north star — live in
+[COMPANION-READER.md](./COMPANION-READER.md). The horizons below are the near-term reputation
+prototype; note that this doc's V1 is the full capability cluster, of which the shipped
+see-and-feel slice is the minimum-coherent seed (v1-core).
 
 ### v1 — coherent reputation prototype
 
@@ -212,6 +223,7 @@ before custom formulas are allowed to expand.
 
 ## Design cluster
 
+- [Companion Reader — north star + V1–V5 horizons](./COMPANION-READER.md)
 - [Reputation model](./features/reputation/OP-reputation.md)
 - [Template ecosystem](./features/template-ecosystem/OP-template-ecosystem.md)
 - [Member index](./features/member-index/OP-member-index.md)
