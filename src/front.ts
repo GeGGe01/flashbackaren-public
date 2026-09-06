@@ -102,12 +102,15 @@ export const FRONT_HTML = /* html */ `<!doctype html>
 </main>
 
 <script>
+// Mount prefix, injected server-side (empty at host root, e.g. "/flashbackaren" under a path route).
+// All API calls go through BASE so the front works identically at root or under a subpath.
+const BASE = "__BASE_PATH__";
 const $ = (s) => document.querySelector(s);
 const results = $('#results');
 const profile = $('#profile');
 
 async function search(q) {
-  const r = await fetch('/api/members?q=' + encodeURIComponent(q));
+  const r = await fetch(BASE + '/api/members?q=' + encodeURIComponent(q));
   const list = await r.json();
   results.innerHTML = '';
   results.style.display = list.length ? 'block' : 'none';
@@ -123,7 +126,7 @@ async function search(q) {
 }
 
 let TEMPLATE = null;
-async function getTemplate(){ if(!TEMPLATE) TEMPLATE = await (await fetch('/api/template')).json(); return TEMPLATE; }
+async function getTemplate(){ if(!TEMPLATE) TEMPLATE = await (await fetch(BASE + '/api/template')).json(); return TEMPLATE; }
 function repLine(p){
   if (p.reputation == null) {
     const act = p.postsPerDay == null ? '' : ' · ' + p.postsPerDay + ' inlägg/dag';
@@ -160,7 +163,7 @@ function reviewsHtml(reviews){
 }
 
 async function openProfile(uid) {
-  const p = await (await fetch('/api/profile?uid=' + encodeURIComponent(uid))).json();
+  const p = await (await fetch(BASE + '/api/profile?uid=' + encodeURIComponent(uid))).json();
   if (p.error) return;
   profile.hidden = false;
   profile.innerHTML =
@@ -193,7 +196,7 @@ function renderDirect(state){
   slider.oninput = () => { yv.textContent = (slider.value/2).toFixed(1) + ' ★'; };
   wireComment();
   $('#submit').onclick = async () => {
-    const d = await (await fetch('/api/rate', { method:'POST', headers:{'Content-Type':'application/json'},
+    const d = await (await fetch(BASE + '/api/rate', { method:'POST', headers:{'Content-Type':'application/json'},
       body: JSON.stringify({ uid: state.uid, mode:'direct', halfsteps: Number(slider.value), comment: getComment() }) })).json();
     if (d.ok) afterRate(state);
     else if (d.error === 'comment_too_long') $('#note').textContent = 'Omdömet är för långt (max 420 tecken / 88 ord).';
@@ -245,7 +248,7 @@ async function renderRich(state){
   $('#submit').onclick = async () => {
     const crits = activeCrits();
     if (!crits.length){ $('#note').textContent = 'Aktivera minst ett kriterium.'; return; }
-    const d = await (await fetch('/api/rate', { method:'POST', headers:{'Content-Type':'application/json'},
+    const d = await (await fetch(BASE + '/api/rate', { method:'POST', headers:{'Content-Type':'application/json'},
       body: JSON.stringify({ uid: state.uid, mode:'rich', template_id: tpl.id, criteria: crits, comment: getComment() }) })).json();
     if (d.ok) afterRate(state);
     else if (d.error === 'comment_too_long') $('#note').textContent = 'Omdömet är för långt (max 420 tecken / 88 ord).';
