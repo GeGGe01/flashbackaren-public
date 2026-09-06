@@ -22,6 +22,42 @@ interface Env {
 
 const COOKIE = 'fb_meta';
 const TEN_YEARS = 60 * 60 * 24 * 365 * 10;
+const UA = 'flashbackaren/0.1 (prototype)';
+
+// Resolve an exact username to a member via Flashback's PUBLIC member search: sok/?query=p:<name>
+// 302-redirects to the profile /uNNN on an exact match. We read the redirect (don't follow),
+// take the canonical username from the public profile <title>, cache the fact, and return it.
+// Returns null on no exact match or any upstream hiccup. Facts only — no content.
+async function resolveMemberUpstream(
+  q: string,
+  env: Env,
+): Promise<{ uid: string; username: string; avg_hs: number | null; cnt: number } | null> {
+  try {
+    const sres = await fetch(
+      'https://www.flashback.org/sok/?query=' + encodeURIComponent('p:' + q),
+      { headers: { 'User-Agent': UA }, redirect: 'manual' },
+    );
+    const loc = sres.headers.get('Location') ?? '';
+    const um = loc.match(/\/u(\d+)/);
+    if (!um) return null;
+    const uid = um[1];
+    const pres = await fetch('https://www.flashback.org/u' + uid, { headers: { 'User-Agent': UA } });
+    const phtml = new TextDecoder('iso-8859-1').decode(await pres.arrayBuffer());
+    const tm = phtml.match(/Visa profil:\s*([^<]+)</);
+    const username = (tm ? decodeEntities(tm[1]) : q).trim();
+    if (!username) return null;
+    const now = new Date().toISOString();
+    await env.DB.prepare(
+      `INSERT INTO members (uid, username, first_seen, last_seen) VALUES (?1, ?2, ?3, ?3)
+       ON CONFLICT (uid) DO UPDATE SET username = excluded.username, last_seen = excluded.last_seen`,
+    )
+      .bind(uid, username, now)
+      .run();
+    return { uid, username, avg_hs: null, cnt: 0 };
+  } catch {
+    return null;
+  }
+}
 
 function readMeta(request: Request): string | null {
   const raw = request.headers.get('Cookie') ?? '';
@@ -84,8 +120,14 @@ export default {
         )
           .bind(`%${q}%`)
           .all<{ uid: string; username: string; avg_hs: number | null; cnt: number }>();
+        let list = rows.results;
+        // Cache-first: on a genuine miss, resolve one exact username upstream (public search) and cache it.
+        if (list.length === 0 && q.length >= 2 && /^[\wåäöÅÄÖ .-]+$/.test(q)) {
+          const found = await resolveMemberUpstream(q, env);
+          if (found) list = [found];
+        }
         return json(
-          rows.results.map((m) => ({
+          list.map((m) => ({
             uid: m.uid,
             username: m.username,
             stars: toStars(m.avg_hs),

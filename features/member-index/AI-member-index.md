@@ -29,6 +29,16 @@ governs:
 > in D1, not in git. Verified: 5 pages → 500 top-posters (incl. **The Crash**, uid 135422, 12 251
 > posts) + 94 moderators = 565 members, post counts + reg dates stored, no mojibake. Post count +
 > account age feed the activity component (Q1) later.
+>
+> **Search-on-miss (built 2026-09-06):** `GET /api/members` is cache-first — it searches the local
+> index, and only on a genuine miss (no local match, plausible username) resolves ONE exact name
+> upstream via Flashback's PUBLIC member search `sok/?query=p:<name>`, which 302-redirects to the
+> profile `/uNNN` on an exact match. We read the redirect (don't follow), take the canonical
+> username from the public profile `<title>` (ISO-8859-1 decoded), cache the fact, and return it.
+> This realises the "miss → lookup → cache" path entirely within the public/trust-domain boundary
+> (no session). Verified: "Webbvavaren" (not preseeded) resolved to uid 1792136 and cached. The
+> upstream call currently rides the interactive request; it should move behind the request
+> budget/queue later.
 
 ## Invariants
 
