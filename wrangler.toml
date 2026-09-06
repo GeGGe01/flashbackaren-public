@@ -3,9 +3,10 @@ main = "src/worker.ts"
 compatibility_date = "2026-09-01"
 
 # v1-core see-and-feel slice. Runs fully local via `wrangler dev` (miniflare emulates D1) —
-# no Cloudflare account needed. The database_id below is a placeholder for local-only work;
-# a real D1 id is wired at deploy time (alchemist / CF), which is deliberately deferred.
+# no Cloudflare account needed for local dev. The database_id below is the real remote D1
+# id (provisioned by alchemist on the account's flashbackaren-v1 database, 2026-09-06).
+# Not a secret — D1 database ids are not sensitive.
 [[d1_databases]]
 binding = "DB"
 database_name = "flashbackaren-v1"
-database_id = "local-placeholder-not-yet-provisioned"
+database_id = "57dff21c-cd39-4f15-9c97-e775bfd93a0e"
