@@ -84,7 +84,21 @@ export default {
         );
       }
 
-      // --- See: one member's aggregate + this browser's current rating.
+      // --- The rating template (its criteria) for the rich rating UI. v1: the one Standard template.
+      if (path === '/api/template' && request.method === 'GET') {
+        const tpl = await env.DB.prepare(
+          `SELECT id, name FROM templates WHERE kind = 'standard' ORDER BY created_at LIMIT 1`,
+        ).first<{ id: string; name: string }>();
+        if (!tpl) return json({ error: 'no_template' }, setCookie);
+        const crit = await env.DB.prepare(
+          `SELECT id, label FROM criteria WHERE template_id = ?1 ORDER BY position`,
+        )
+          .bind(tpl.id)
+          .all<{ id: string; label: string }>();
+        return json({ id: tpl.id, name: tpl.name, criteria: crit.results }, setCookie);
+      }
+
+      // --- See: one member's aggregate + this browser's current rating (with rich breakdown).
       if (path === '/api/profile' && request.method === 'GET') {
         const uid = (url.searchParams.get('uid') ?? '').trim();
         const member = await env.DB.prepare(`SELECT uid, username FROM members WHERE uid = ?1`)
@@ -97,10 +111,20 @@ export default {
           .bind(uid)
           .first<{ avg_hs: number | null; cnt: number }>();
         const mine = await env.DB.prepare(
-          `SELECT score_halfsteps AS hs FROM ratings WHERE rater_meta_id = ?1 AND target_uid = ?2`,
+          `SELECT score_halfsteps AS hs, mode, template_id FROM ratings WHERE rater_meta_id = ?1 AND target_uid = ?2`,
         )
           .bind(meta, uid)
-          .first<{ hs: number }>();
+          .first<{ hs: number; mode: string; template_id: string | null }>();
+        let yourCriteria: { criterion_id: string; halfsteps: number; weight: number }[] = [];
+        if (mine?.mode === 'rich') {
+          const rc = await env.DB.prepare(
+            `SELECT criterion_id, score_halfsteps AS halfsteps, weight
+               FROM rating_criteria WHERE rater_meta_id = ?1 AND target_uid = ?2`,
+          )
+            .bind(meta, uid)
+            .all<{ criterion_id: string; halfsteps: number; weight: number }>();
+          yourCriteria = rc.results;
+        }
         return json(
           {
             uid: member.uid,
@@ -108,41 +132,121 @@ export default {
             stars: toStars(agg?.avg_hs ?? null),
             count: agg?.cnt ?? 0,
             yourHalfsteps: mine?.hs ?? null,
+            yourMode: mine?.mode ?? null,
+            yourCriteria,
           },
           setCookie,
         );
       }
 
-      // --- Rate: upsert this browser's direct rating for a member. Re-rating updates, never stacks.
+      // --- Rate: upsert this browser's rating for a member. Re-rating updates, never stacks.
+      // Two modes: 'direct' ({halfsteps}) or 'rich' ({template_id, criteria:[{criterion_id, halfsteps, weight}]}),
+      // where the stored overall score is the weighted mean of the criteria.
       if (path === '/api/rate' && request.method === 'POST') {
         const body = (await request.json().catch(() => ({}))) as {
           uid?: string;
+          mode?: string;
           halfsteps?: number;
+          template_id?: string;
+          criteria?: { criterion_id: string; halfsteps: number; weight: number }[];
         };
         const uid = (body.uid ?? '').trim();
-        const hs = Number(body.halfsteps);
-        if (!uid || !Number.isInteger(hs) || hs < 0 || hs > 10) {
-          return json({ error: 'bad_request' }, setCookie);
-        }
+        if (!uid) return json({ error: 'bad_request' }, setCookie);
         const member = await env.DB.prepare(`SELECT uid FROM members WHERE uid = ?1`)
           .bind(uid)
           .first();
         if (!member) return json({ error: 'not_found' }, setCookie);
+
+        const now = new Date().toISOString();
+        let finalHs: number;
+        let mode: 'direct' | 'rich';
+        let templateId: string | null = null;
+        let rows: { criterion_id: string; halfsteps: number; weight: number }[] = [];
+
+        if (body.mode === 'rich') {
+          mode = 'rich';
+          templateId = (body.template_id ?? '').trim();
+          const input = Array.isArray(body.criteria) ? body.criteria : [];
+          if (!templateId || input.length < 1 || input.length > 10) {
+            return json({ error: 'bad_request' }, setCookie);
+          }
+          // Only accept criteria that actually belong to the template (no injected ids).
+          const valid = await env.DB.prepare(`SELECT id FROM criteria WHERE template_id = ?1`)
+            .bind(templateId)
+            .all<{ id: string }>();
+          const allowed = new Set(valid.results.map((c) => c.id));
+          const seen = new Set<string>();
+          let wsum = 0;
+          let acc = 0;
+          for (const c of input) {
+            const cid = String(c.criterion_id);
+            const hs = Number(c.halfsteps);
+            const w = Number(c.weight);
+            if (
+              !allowed.has(cid) ||
+              seen.has(cid) ||
+              !Number.isInteger(hs) ||
+              hs < 0 ||
+              hs > 10 ||
+              !Number.isInteger(w) ||
+              w < 1 ||
+              w > 5
+            ) {
+              return json({ error: 'bad_request' }, setCookie);
+            }
+            seen.add(cid);
+            wsum += w;
+            acc += hs * w;
+            rows.push({ criterion_id: cid, halfsteps: hs, weight: w });
+          }
+          finalHs = Math.round(acc / wsum); // weighted mean of the criteria, 0..10
+        } else {
+          mode = 'direct';
+          const hs = Number(body.halfsteps);
+          if (!Number.isInteger(hs) || hs < 0 || hs > 10) {
+            return json({ error: 'bad_request' }, setCookie);
+          }
+          finalHs = hs;
+        }
+
         await env.DB.prepare(
-          `INSERT INTO ratings (rater_meta_id, target_uid, score_halfsteps, updated_at)
-             VALUES (?1, ?2, ?3, ?4)
-           ON CONFLICT (rater_meta_id, target_uid)
-             DO UPDATE SET score_halfsteps = excluded.score_halfsteps, updated_at = excluded.updated_at`,
+          `INSERT INTO ratings (rater_meta_id, target_uid, score_halfsteps, updated_at, mode, template_id)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+           ON CONFLICT (rater_meta_id, target_uid) DO UPDATE SET
+             score_halfsteps = excluded.score_halfsteps, updated_at = excluded.updated_at,
+             mode = excluded.mode, template_id = excluded.template_id`,
         )
-          .bind(meta, uid, hs, new Date().toISOString())
+          .bind(meta, uid, finalHs, now, mode, templateId)
           .run();
+
+        // Replace any prior per-criterion breakdown for this (rater, target).
+        await env.DB.prepare(
+          `DELETE FROM rating_criteria WHERE rater_meta_id = ?1 AND target_uid = ?2`,
+        )
+          .bind(meta, uid)
+          .run();
+        for (const r of rows) {
+          await env.DB.prepare(
+            `INSERT INTO rating_criteria (rater_meta_id, target_uid, criterion_id, score_halfsteps, weight)
+               VALUES (?1, ?2, ?3, ?4, ?5)`,
+          )
+            .bind(meta, uid, r.criterion_id, r.halfsteps, r.weight)
+            .run();
+        }
+
         const agg = await env.DB.prepare(
           `SELECT AVG(score_halfsteps) AS avg_hs, COUNT(*) AS cnt FROM ratings WHERE target_uid = ?1`,
         )
           .bind(uid)
           .first<{ avg_hs: number | null; cnt: number }>();
         return json(
-          { ok: true, stars: toStars(agg?.avg_hs ?? null), count: agg?.cnt ?? 0, yourHalfsteps: hs },
+          {
+            ok: true,
+            stars: toStars(agg?.avg_hs ?? null),
+            count: agg?.cnt ?? 0,
+            yourHalfsteps: finalHs,
+            yourMode: mode,
+          },
           setCookie,
         );
       }

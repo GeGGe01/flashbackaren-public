@@ -55,6 +55,20 @@ export const FRONT_HTML = /* html */ `<!doctype html>
   button { background:var(--primary); color:#fff; border:1px solid #2e6da4; border-radius:3px; padding:7px 14px; font-weight:600; font-size:14px; cursor:pointer; }
   button.ghost { background:#fff; color:var(--muted); border:1px solid var(--frame); }
   .muted { color:var(--muted); font-size:12px; }
+
+  .modes { display:flex; gap:6px; margin-top:14px; }
+  .mode { background:#fff; color:var(--muted); border:1px solid var(--frame); border-radius:3px; padding:5px 12px; font-size:13px; font-weight:600; cursor:pointer; }
+  .mode.active { background:var(--primary); color:#fff; border-color:#2e6da4; }
+  .tpl-name { color:var(--muted); font-size:12px; margin:12px 0 6px; }
+  .crit { padding:8px 0; border-bottom:1px solid var(--row2); }
+  .crit-head { display:flex; justify-content:space-between; font-size:14px; }
+  .crit-label { font-weight:600; }
+  .crit-val { color:var(--star); font-weight:700; font-variant-numeric:tabular-nums; }
+  .crit-row { display:flex; align-items:center; gap:12px; margin-top:4px; }
+  .crit-row input[type=range] { flex:1; accent-color:var(--primary); }
+  .wlab { font-size:12px; color:var(--muted); white-space:nowrap; }
+  .wlab select { margin-left:4px; }
+  #rich-final { color:var(--star); }
 </style>
 </head>
 <body>
@@ -94,34 +108,87 @@ async function search(q) {
   }
 }
 
+let TEMPLATE = null;
+async function getTemplate(){ if(!TEMPLATE) TEMPLATE = await (await fetch('/api/template')).json(); return TEMPLATE; }
+function fmtAgg(stars, count){ return (stars == null ? '–' : '★ ' + stars) + '<span class="count"> (' + count + ' röster)</span>'; }
+function afterRate(d){ $('#agg').innerHTML = fmtAgg(d.stars, d.count); $('#note').textContent = 'Ditt betyg sparat.'; search($('#q').value); }
+
 async function openProfile(uid) {
-  const r = await fetch('/api/profile?uid=' + encodeURIComponent(uid));
-  const p = await r.json();
+  const p = await (await fetch('/api/profile?uid=' + encodeURIComponent(uid))).json();
   if (p.error) return;
-  const hs = p.yourHalfsteps == null ? 0 : p.yourHalfsteps;
   profile.hidden = false;
   profile.innerHTML =
     '<h2>' + esc(p.username) + '</h2>' +
-    '<div class="agg" id="agg">' + (p.stars == null ? '–' : '★ ' + p.stars) +
-      '<span class="count" id="cnt"> (' + p.count + ' röster)</span></div>' +
-    '<div class="rate-row"><input type="range" id="slider" min="0" max="10" step="1" value="' + hs + '">' +
-      '<span class="yourval" id="yourval">' + (hs/2).toFixed(1) + ' ★</span></div>' +
-    '<div class="rate-row"><button id="submit">Betygsätt</button>' +
-      '<button class="ghost" id="close">Stäng</button>' +
+    '<div class="agg" id="agg">' + fmtAgg(p.stars, p.count) + '</div>' +
+    '<div class="modes"><button class="mode" data-m="direct">Direkt</button>' +
+      '<button class="mode" data-m="rich">Kriterier</button></div>' +
+    '<div id="rate-area"></div>' +
+    '<div class="rate-row"><button class="ghost" id="close">Stäng</button>' +
       '<span class="muted" id="note">' + (p.yourHalfsteps==null ? 'Du har inte betygsatt än.' : 'Ditt betyg.') + '</span></div>';
-  const slider = $('#slider'), yourval = $('#yourval');
-  slider.oninput = () => { yourval.textContent = (slider.value/2).toFixed(1) + ' ★'; };
-  $('#submit').onclick = async () => {
-    const res = await fetch('/api/rate', { method:'POST', headers:{'Content-Type':'application/json'},
-      body: JSON.stringify({ uid, halfsteps: Number(slider.value) }) });
-    const d = await res.json();
-    if (d.ok) {
-      $('#agg').innerHTML = '★ ' + d.stars + '<span class="count"> (' + d.count + ' röster)</span>';
-      $('#note').textContent = 'Ditt betyg sparat.';
-      search($('#q').value);
-    }
-  };
+  const state = { uid, p };
+  const modeBtns = profile.querySelectorAll('.mode');
+  function selectMode(m){
+    modeBtns.forEach(b => b.classList.toggle('active', b.dataset.m === m));
+    if (m === 'rich') renderRich(state); else renderDirect(state);
+  }
+  modeBtns.forEach(b => b.onclick = () => selectMode(b.dataset.m));
   $('#close').onclick = () => { profile.hidden = true; };
+  selectMode(p.yourMode === 'rich' ? 'rich' : 'direct');
+}
+
+function renderDirect(state){
+  const hs = (state.p.yourMode !== 'rich' && state.p.yourHalfsteps != null) ? state.p.yourHalfsteps : 0;
+  $('#rate-area').innerHTML =
+    '<div class="rate-row"><input type="range" id="slider" min="0" max="10" step="1" value="' + hs + '">' +
+      '<span class="yourval" id="yourval">' + (hs/2).toFixed(1) + ' ★</span>' +
+      '<button id="submit">Betygsätt</button></div>';
+  const slider = $('#slider'), yv = $('#yourval');
+  slider.oninput = () => { yv.textContent = (slider.value/2).toFixed(1) + ' ★'; };
+  $('#submit').onclick = async () => {
+    const d = await (await fetch('/api/rate', { method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({ uid: state.uid, mode:'direct', halfsteps: Number(slider.value) }) })).json();
+    if (d.ok) afterRate(d);
+  };
+}
+
+async function renderRich(state){
+  const tpl = await getTemplate();
+  const prev = {}; (state.p.yourCriteria||[]).forEach(c => prev[c.criterion_id] = c);
+  const rowsHtml = tpl.criteria.map(c => {
+    const pc = prev[c.id]; const hs = pc ? pc.halfsteps : 0; const w = pc ? pc.weight : 1;
+    return '<div class="crit" data-cid="'+c.id+'">' +
+      '<div class="crit-head"><span class="crit-label">'+esc(c.label)+'</span>' +
+        '<span class="crit-val">'+(hs/2).toFixed(1)+' ★</span></div>' +
+      '<div class="crit-row"><input type="range" class="c-score" min="0" max="10" step="1" value="'+hs+'">' +
+        '<label class="wlab">vikt <select class="c-weight">' +
+          [1,2,3,4,5].map(x=>'<option'+(x===w?' selected':'')+'>'+x+'</option>').join('') +
+        '</select></label></div></div>';
+  }).join('');
+  $('#rate-area').innerHTML = '<p class="tpl-name">Mall: '+esc(tpl.name)+' · viktat snitt</p>' + rowsHtml +
+    '<div class="rate-row"><strong>Blir <span id="rich-final">–</span></strong>' +
+      '<button id="submit">Betygsätt</button></div>';
+  const crits = () => [...profile.querySelectorAll('.crit')].map(el => ({
+    criterion_id: el.dataset.cid,
+    halfsteps: Number(el.querySelector('.c-score').value),
+    weight: Number(el.querySelector('.c-weight').value),
+  }));
+  function recompute(){
+    let w=0, a=0;
+    profile.querySelectorAll('.crit').forEach(el => {
+      const s = Number(el.querySelector('.c-score').value);
+      const wt = Number(el.querySelector('.c-weight').value);
+      w += wt; a += s * wt;
+      el.querySelector('.crit-val').textContent = (s/2).toFixed(1) + ' ★';
+    });
+    $('#rich-final').textContent = (w ? Math.round(a/w)/2 : 0).toFixed(1) + ' ★';
+  }
+  profile.querySelectorAll('.c-score, .c-weight').forEach(i => { i.oninput = recompute; i.onchange = recompute; });
+  recompute();
+  $('#submit').onclick = async () => {
+    const d = await (await fetch('/api/rate', { method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({ uid: state.uid, mode:'rich', template_id: tpl.id, criteria: crits() }) })).json();
+    if (d.ok) afterRate(d);
+  };
 }
 
 function esc(s){ return String(s).replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c])); }
