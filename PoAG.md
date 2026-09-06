@@ -156,6 +156,11 @@ Candidate horizon only:
 
 ## Open questions
 
+> Reconciled 2026-09-06 against Dexter's review — see
+> [docs-review/REVIEW-2026-09-06.md](./docs-review/REVIEW-2026-09-06.md) for the current ledger
+> (removed/resolved/new/kept-open) and the P0/P1/P2 priorities. The Q1–Q7 below are the originals,
+> most now folded into that reconciled ledger.
+
 ### Q1 — Final rating aggregation formula
 
 Planned major: v1  
