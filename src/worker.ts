@@ -40,6 +40,17 @@ function toStars(avgHalfsteps: number | null): number | null {
   return avgHalfsteps == null ? null : Math.round((avgHalfsteps / 2) * 10) / 10;
 }
 
+// Flashback serves ISO-8859-1; decode a small set of HTML entities left in usernames.
+function decodeEntities(s: string): string {
+  const named: Record<string, string> = {
+    amp: '&', lt: '<', gt: '>', quot: '"', apos: "'", nbsp: ' ',
+    aring: 'å', auml: 'ä', ouml: 'ö', Aring: 'Å', Auml: 'Ä', Ouml: 'Ö', eacute: 'é',
+  };
+  return s
+    .replace(/&#(\d+);/g, (_, d) => String.fromCodePoint(Number(d)))
+    .replace(/&([a-zA-Z]+);/g, (whole, name) => named[name] ?? whole);
+}
+
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
     const url = new URL(request.url);
@@ -249,6 +260,38 @@ export default {
           },
           setCookie,
         );
+      }
+
+      // --- Cold-boot preseed: populate the member index from Flashback's PUBLIC moderators page.
+      // (The top-posters memberlist is authenticated-only — 401 — so it stays on the far side of the
+      // trust-domain boundary and is deliberately NOT fetched here.) Later this becomes a background
+      // job; for now it's an explicit trigger so the fetch/parse pipeline can be run and verified.
+      if (path === '/api/preseed/moderators' && request.method === 'POST') {
+        const res = await fetch('https://www.flashback.org/moderatorer', {
+          headers: { 'User-Agent': 'flashbackaren-preseed/0.1 (prototype)' },
+        });
+        if (!res.ok) return json({ error: 'upstream', status: res.status }, setCookie);
+        const html = new TextDecoder('iso-8859-1').decode(await res.arrayBuffer());
+        const re = /href="\/u(\d+)"\s+class="bold">([^<]+)<\/a>/g;
+        const now = new Date().toISOString();
+        const seen = new Set<string>();
+        let upserted = 0;
+        let m: RegExpExecArray | null;
+        while ((m = re.exec(html)) !== null) {
+          const uid = m[1];
+          if (uid === '0' || seen.has(uid)) continue;
+          seen.add(uid);
+          const username = decodeEntities(m[2]).trim();
+          if (!username) continue;
+          await env.DB.prepare(
+            `INSERT INTO members (uid, username, first_seen, last_seen) VALUES (?1, ?2, ?3, ?3)
+             ON CONFLICT (uid) DO UPDATE SET username = excluded.username, last_seen = excluded.last_seen`,
+          )
+            .bind(uid, username, now)
+            .run();
+          upserted++;
+        }
+        return json({ source: 'moderatorer', upserted }, setCookie);
       }
 
       // --- The see-and-feel front end.

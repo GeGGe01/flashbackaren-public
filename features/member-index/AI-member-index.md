@@ -10,10 +10,18 @@ governs:
 
 # Member index — agent contract
 
-> **v1-core slice (built 2026-09-05):** local search over a seeded index only. The index is
-> pre-seeded with synthetic demo members (`0002_seed_demo.sql`) — upstream lookup on miss and
-> the real Q5 pre-seed (early members / moderators) are deferred, so the skeleton indexes no
-> real person. UID is the primary key; username is stored verbatim.
+> **Real cold-boot preseed (built 2026-09-06):** `POST /api/preseed/moderators` fetches
+> Flashback's **public** moderators page, decodes it (ISO-8859-1), parses `/uNNN` + username, and
+> upserts real members into the index (verified: 94 moderators, no mojibake, searchable). UID
+> (the Flashback UID) is the primary key; username is stored verbatim; we store only these facts,
+> never post content. Synthetic demo members remain for offline play.
+>
+> **Boundary finding (Q5):** the top-posters **memberlist** (`memberlist.php?do=getall…`) is
+> **authenticated-only** (HTTP 401 "Du är inte inloggad"), so it is on the far side of the
+> trust-domain boundary and is NOT fetched. Individual member **profiles** (`/uNNN`) ARE public,
+> so specific named members (e.g. via a known handle/UID) can be added directly; the bulk
+> top-posters ranking is unavailable without a session and stays out. Later this preseed becomes a
+> background job (Queues/Cron); it is an explicit trigger for now.
 
 ## Invariants
 
