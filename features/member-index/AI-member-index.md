@@ -38,9 +38,12 @@ governs:
 > This realises the "miss → lookup → cache" path entirely within the public/trust-domain boundary
 > (no session). Verified: "Webbvavaren" (not preseeded) resolved to uid 1792136 and cached. The
 > upstream call currently rides the interactive request; it should move behind the request
-> budget/queue later. On-miss also captures the public **reg date** (`Reg: <strong>…</strong>`);
-> the **post count is NOT on the public profile** (only the gated memberlist), so posts stay a
-> separate operator-export pipeline.
+> budget/queue later. On-miss also captures the public **reg date** (`Reg: <strong>…</strong>`,
+> in the static HTML) and last-activity. The **post count IS public but JS-rendered** on the
+> profile — it is NOT in the static HTML our server fetch receives (verified on u1/u135422), so it
+> is not captured server-side on-miss. The reliable static source for post counts is the gated
+> **memberlist** (operator export); a JS-capable fetch or the underlying data endpoint would be
+> needed to get posts for arbitrary on-miss members (not pursued now).
 >
 > **Resilience risk (2026-09-06):** the `p:` resolver is public (verified in incognito) but
 > Flashback now knows about it (the entry was found by trial-and-error and posted in a thread), so
@@ -48,7 +51,8 @@ governs:
 > and — if broader coverage is wanted before any closure — a **paced** background crawl of PUBLIC
 > **thread** pages (each post author is a `/uNNN` link, independent of `p:`) is the robust
 > index-building source. Keep it paced: an aggressive burst could invite a faster shutdown. Post
-> counts remain gated regardless, refreshed via operator memberlist exports.
+> counts are public but JS-rendered (see above), so server-side they come from the memberlist
+> export or a future JS-capable/endpoint fetch — the `p:` closure does not affect that.
 
 ## Invariants
 
