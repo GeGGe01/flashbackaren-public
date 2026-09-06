@@ -294,6 +294,39 @@ export default {
         return json({ source: 'moderatorer', upserted }, setCookie);
       }
 
+      // --- Import a memberlist page the operator exported while logged in. The authenticated
+      // fetch happens on the human's side (we hold no session); we only parse FACTS (UID, username,
+      // reg date, post count) out of the posted HTML and drop everything else (avatars etc.).
+      if (path === '/api/preseed/memberlist' && request.method === 'POST') {
+        const htmlBody = await request.text();
+        const re =
+          /flashback\.org\/u(\d+)\s+class=bold>([^<]+)<\/a>[\s\S]{0,400}?Reg:\s*(\d{4}-\d{2}-\d{2})[\s\S]{0,200}?Inlägg:\s*([^<]+?)</g;
+        const now = new Date().toISOString();
+        const seen = new Set<string>();
+        let upserted = 0;
+        let m: RegExpExecArray | null;
+        while ((m = re.exec(htmlBody)) !== null) {
+          const uid = m[1];
+          if (seen.has(uid)) continue;
+          seen.add(uid);
+          const username = decodeEntities(m[2]).trim();
+          const regDate = m[3];
+          const posts = parseInt(m[4].replace(/[^\d]/g, ''), 10) || null;
+          if (!username) continue;
+          await env.DB.prepare(
+            `INSERT INTO members (uid, username, first_seen, last_seen, posts, reg_date)
+               VALUES (?1, ?2, ?3, ?3, ?4, ?5)
+             ON CONFLICT (uid) DO UPDATE SET
+               username = excluded.username, last_seen = excluded.last_seen,
+               posts = excluded.posts, reg_date = excluded.reg_date`,
+          )
+            .bind(uid, username, now, posts, regDate)
+            .run();
+          upserted++;
+        }
+        return json({ source: 'memberlist', upserted }, setCookie);
+      }
+
       // --- The see-and-feel front end.
       if (path === '/' && request.method === 'GET') {
         const { FRONT_HTML } = await import('./front');

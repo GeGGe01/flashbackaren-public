@@ -6,6 +6,7 @@ fork: F0
 governs:
   - src/worker.ts
   - migrations/0002_seed_demo.sql
+  - migrations/0004_member_facts.sql
 ---
 
 # Member index — agent contract
@@ -17,11 +18,17 @@ governs:
 > never post content. Synthetic demo members remain for offline play.
 >
 > **Boundary finding (Q5):** the top-posters **memberlist** (`memberlist.php?do=getall…`) is
-> **authenticated-only** (HTTP 401 "Du är inte inloggad"), so it is on the far side of the
-> trust-domain boundary and is NOT fetched. Individual member **profiles** (`/uNNN`) ARE public,
-> so specific named members (e.g. via a known handle/UID) can be added directly; the bulk
-> top-posters ranking is unavailable without a session and stays out. Later this preseed becomes a
-> background job (Queues/Cron); it is an explicit trigger for now.
+> **authenticated-only** (HTTP 401 "Du är inte inloggad"), so *we* never fetch it — we hold no
+> Flashback session. Individual member **profiles** (`/uNNN`) are public.
+>
+> **Human-in-the-loop import (built 2026-09-06):** the authenticated fetch happens on the
+> operator's side — they export the memberlist pages while logged in and POST the saved HTML to
+> `POST /api/preseed/memberlist`, which parses **facts only** (UID, username, reg date, post count)
+> out of each `media media-user` block and drops everything else (avatars etc.). This keeps the
+> trust boundary intact (the session is the human's, never ours) and keeps the real-member corpus
+> in D1, not in git. Verified: 5 pages → 500 top-posters (incl. **The Crash**, uid 135422, 12 251
+> posts) + 94 moderators = 565 members, post counts + reg dates stored, no mojibake. Post count +
+> account age feed the activity component (Q1) later.
 
 ## Invariants
 
