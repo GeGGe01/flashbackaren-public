@@ -6,9 +6,11 @@
   "scripts": {
     "db:migrate:local": "wrangler d1 migrations apply flashbackaren-v1 --local",
     "dev": "wrangler dev",
+    "test": "vitest run",
     "typecheck": "tsc --noEmit"
   },
   "devDependencies": {
+    "vitest": "^3.0.0",
     "wrangler": "^4.0.0"
   },
   "allowScripts": {
