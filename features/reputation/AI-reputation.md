@@ -19,6 +19,12 @@ governs:
 > mean of raters' overall scores, so direct and rich raters mix cleanly. Re-rating replaces the
 > rater's single row (and clears the old breakdown).
 >
+> **"Ej bedömd" (built 2026-09-06, P0):** each criterion has an ACTIVE state — unrated by default,
+> not zero. Only active criteria enter the weighted mean and are stored; a rich rating needs ≥1
+> active criterion. So "I didn't judge Humor" (unrated) is distinct from "Humor = 0" (a judgement).
+> On re-edit, previously-rated criteria are pre-activated; the rest show "ingår ej". Verified: a
+> 2-of-4 rating means only over those two and round-trips exactly two.
+>
 > **Activity component (built 2026-09-06, Q1):** the profile now shows reputation
 > `R = min(5, B + 0.1·P)`, where B is the community mean and P = posts / account-age-days (from the
 > stored posts + reg_date). Activity is a SEPARATE, small bump — not quality — and only applies when

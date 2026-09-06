@@ -71,6 +71,9 @@ export const FRONT_HTML = /* html */ `<!doctype html>
   .wlab { font-size:12px; color:var(--muted); white-space:nowrap; }
   .wlab select { margin-left:4px; }
   #rich-final { color:var(--star); }
+  .crit.off { opacity:.5; }
+  .crit.off .crit-val { color:var(--muted); font-style:italic; }
+  .crit-label { cursor:pointer; display:inline-flex; align-items:center; gap:5px; }
   .cbox { margin-top:12px; }
   .cbox textarea { width:100%; padding:8px 10px; border:1px solid var(--frame); font:14px var(--sans); resize:vertical; }
   .ccount { font-size:11px; color:var(--muted); margin-top:3px; }
@@ -199,41 +202,51 @@ function renderDirect(state){
 
 async function renderRich(state){
   const tpl = await getTemplate();
+  // A criterion you previously rated starts ACTIVE; the rest start unrated ("ingår ej"). Unrated is
+  // NOT zero — only active criteria enter the weighted mean and get stored.
   const prev = {}; (state.p.yourCriteria||[]).forEach(c => prev[c.criterion_id] = c);
   const rowsHtml = tpl.criteria.map(c => {
-    const pc = prev[c.id]; const hs = pc ? pc.halfsteps : 0; const w = pc ? pc.weight : 1;
-    return '<div class="crit" data-cid="'+c.id+'">' +
-      '<div class="crit-head"><span class="crit-label">'+esc(c.label)+'</span>' +
-        '<span class="crit-val">'+(hs/2).toFixed(1)+' ★</span></div>' +
-      '<div class="crit-row"><input type="range" class="c-score" min="0" max="10" step="1" value="'+hs+'">' +
-        '<label class="wlab">vikt <select class="c-weight">' +
+    const pc = prev[c.id]; const on = !!pc; const hs = pc ? pc.halfsteps : 0; const w = pc ? pc.weight : 1;
+    return '<div class="crit'+(on?'':' off')+'" data-cid="'+c.id+'">' +
+      '<div class="crit-head"><label class="crit-label"><input type="checkbox" class="c-active"'+(on?' checked':'')+'> '+esc(c.label)+'</label>' +
+        '<span class="crit-val">'+(on?(hs/2).toFixed(1)+' ★':'ingår ej')+'</span></div>' +
+      '<div class="crit-row"><input type="range" class="c-score" min="0" max="10" step="1" value="'+hs+'"'+(on?'':' disabled')+'>' +
+        '<label class="wlab">vikt <select class="c-weight"'+(on?'':' disabled')+'>' +
           [1,2,3,4,5].map(x=>'<option'+(x===w?' selected':'')+'>'+x+'</option>').join('') +
         '</select></label></div></div>';
   }).join('');
-  $('#rate-area').innerHTML = '<p class="tpl-name">Mall: '+esc(tpl.name)+' · viktat snitt</p>' + rowsHtml +
+  $('#rate-area').innerHTML = '<p class="tpl-name">Mall: '+esc(tpl.name)+' · viktat snitt av aktiva kriterier</p>' + rowsHtml +
     '<div class="rate-row"><strong>Blir <span id="rich-final">–</span></strong>' +
       '<button id="submit">Betygsätt</button></div>' + commentFieldHtml(state.p.yourComment);
-  const crits = () => [...profile.querySelectorAll('.crit')].map(el => ({
-    criterion_id: el.dataset.cid,
-    halfsteps: Number(el.querySelector('.c-score').value),
-    weight: Number(el.querySelector('.c-weight').value),
-  }));
+  const activeCrits = () => [...profile.querySelectorAll('.crit')]
+    .filter(el => el.querySelector('.c-active').checked)
+    .map(el => ({
+      criterion_id: el.dataset.cid,
+      halfsteps: Number(el.querySelector('.c-score').value),
+      weight: Number(el.querySelector('.c-weight').value),
+    }));
   function recompute(){
-    let w=0, a=0;
+    let w=0, a=0, n=0;
     profile.querySelectorAll('.crit').forEach(el => {
+      const on = el.querySelector('.c-active').checked;
+      el.classList.toggle('off', !on);
+      el.querySelector('.c-score').disabled = !on;
+      el.querySelector('.c-weight').disabled = !on;
       const s = Number(el.querySelector('.c-score').value);
       const wt = Number(el.querySelector('.c-weight').value);
-      w += wt; a += s * wt;
-      el.querySelector('.crit-val').textContent = (s/2).toFixed(1) + ' ★';
+      el.querySelector('.crit-val').textContent = on ? (s/2).toFixed(1)+' ★' : 'ingår ej';
+      if (on){ w += wt; a += s*wt; n++; }
     });
-    $('#rich-final').textContent = (w ? Math.round(a/w)/2 : 0).toFixed(1) + ' ★';
+    $('#rich-final').textContent = n ? (Math.round(a/w)/2).toFixed(1)+' ★' : '—';
   }
-  profile.querySelectorAll('.c-score, .c-weight').forEach(i => { i.oninput = recompute; i.onchange = recompute; });
+  profile.querySelectorAll('.c-active, .c-score, .c-weight').forEach(i => { i.oninput = recompute; i.onchange = recompute; });
   recompute();
   wireComment();
   $('#submit').onclick = async () => {
+    const crits = activeCrits();
+    if (!crits.length){ $('#note').textContent = 'Aktivera minst ett kriterium.'; return; }
     const d = await (await fetch('/api/rate', { method:'POST', headers:{'Content-Type':'application/json'},
-      body: JSON.stringify({ uid: state.uid, mode:'rich', template_id: tpl.id, criteria: crits(), comment: getComment() }) })).json();
+      body: JSON.stringify({ uid: state.uid, mode:'rich', template_id: tpl.id, criteria: crits, comment: getComment() }) })).json();
     if (d.ok) afterRate(state);
     else if (d.error === 'comment_too_long') $('#note').textContent = 'Omdömet är för långt (max 420 tecken / 88 ord).';
   };
