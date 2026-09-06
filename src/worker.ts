@@ -24,6 +24,25 @@ interface D1Database {
 interface Env {
   DB: D1Database;
   ADMIN_SECRET?: string; // server-side secret gating the preseed/import endpoints (wrangler secret / .dev.vars)
+  // Mount prefix when served under a path route (e.g. "/flashbackaren" for typ.gegge.se/flashbackaren).
+  // Empty/unset = mounted at the host root (workers.dev, a dedicated subdomain, local dev).
+  BASE_PATH?: string;
+}
+
+// Normalize the mount prefix: trim a trailing slash so "/flashbackaren/" and "/flashbackaren" behave
+// the same, and treat "/" as root (no prefix). Everything downstream routes on the base-relative path.
+export function normalizeBase(raw: string | undefined): string {
+  const b = (raw ?? '').trim().replace(/\/+$/, '');
+  return b === '/' ? '' : b;
+}
+
+// Map an incoming pathname to its base-relative route. Only strips when the base is followed by "/"
+// or ends the path — so "/flashbackaren-evil" is NOT treated as living under "/flashbackaren".
+export function mountRelativePath(base: string, pathname: string): string {
+  if (base && (pathname === base || pathname.startsWith(base + '/'))) {
+    return pathname.slice(base.length) || '/';
+  }
+  return pathname;
 }
 
 const COOKIE = 'fb_meta';
@@ -157,7 +176,11 @@ function decodeEntities(s: string): string {
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
     const url = new URL(request.url);
-    const path = url.pathname;
+    // Base-path support: a Workers Route like `typ.gegge.se/flashbackaren*` delivers requests with the
+    // full pathname (CF does NOT strip the route prefix), so strip it here and route on the remainder.
+    // The front end fetches against the same base (injected into the HTML below), so both sides agree.
+    const base = normalizeBase(env.BASE_PATH);
+    const path = mountRelativePath(base, url.pathname);
 
     // Resolve the browser-owned meta identity; mint one on first contact. This is only an
     // OWNERSHIP key (one browser = one current rating per member), not a person and not hardened.
@@ -167,8 +190,10 @@ export default {
       meta = crypto.randomUUID();
       // Secure over HTTPS (production / workers.dev); omitted on local http dev so the cookie still sets.
       const secure = url.protocol === 'https:' ? '; Secure' : '';
+      // Scope the cookie to the mount prefix so it doesn't leak to sibling paths on a shared host.
+      const cookiePath = base || '/';
       setCookie = {
-        'Set-Cookie': `${COOKIE}=${meta}; Path=/; Max-Age=${TEN_YEARS}; SameSite=Lax; HttpOnly${secure}`,
+        'Set-Cookie': `${COOKIE}=${meta}; Path=${cookiePath}; Max-Age=${TEN_YEARS}; SameSite=Lax; HttpOnly${secure}`,
       };
     }
 
@@ -463,7 +488,9 @@ export default {
       // --- The see-and-feel front end.
       if (path === '/' && request.method === 'GET') {
         const { FRONT_HTML } = await import('./front');
-        return new Response(FRONT_HTML, {
+        // Inject the mount prefix so the front end's fetch() calls target `${base}/api/...`.
+        const html = FRONT_HTML.replaceAll('__BASE_PATH__', base);
+        return new Response(html, {
           headers: { 'Content-Type': 'text/html; charset=utf-8', ...(setCookie ?? {}) },
         });
       }
