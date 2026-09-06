@@ -3,6 +3,10 @@
 // Deliberately trivial to game (no anti-abuse hardening) — the point of the first surface is to
 // feel the reputation model with honest users, not to resist abuse. See PoAG.md / the AI docs.
 
+// All Flashback bytes cross exactly one boundary — the FlashbackNormalizer — which yields canonical
+// UTF-8 + source metadata. Nothing below decodes upstream bytes itself; parsers assume UTF-8.
+import { fetchFlashback, normalizeBytes } from './flashback';
+
 // Minimal local shapes so the worker needs no @cloudflare/workers-types dependency.
 interface D1Result<T = Record<string, unknown>> {
   results: T[];
@@ -22,42 +26,50 @@ interface Env {
 
 const COOKIE = 'fb_meta';
 const TEN_YEARS = 60 * 60 * 24 * 365 * 10;
-const UA = 'flashbackaren/0.1 (prototype)';
+// One place to upsert a member. Partial facts don't clobber existing ones (COALESCE), so a
+// moderators-page hit (no posts) won't wipe a post count learned from the memberlist, etc.
+async function upsertMember(
+  env: Env,
+  m: { uid: string; username: string; regDate?: string | null; posts?: number | null; sourceUrl?: string | null },
+): Promise<void> {
+  const now = new Date().toISOString();
+  await env.DB.prepare(
+    `INSERT INTO members (uid, username, first_seen, last_seen, reg_date, posts, source_url)
+       VALUES (?1, ?2, ?3, ?3, ?4, ?5, ?6)
+     ON CONFLICT (uid) DO UPDATE SET
+       username   = excluded.username,
+       last_seen  = excluded.last_seen,
+       reg_date   = COALESCE(excluded.reg_date, members.reg_date),
+       posts      = COALESCE(excluded.posts, members.posts),
+       source_url = COALESCE(excluded.source_url, members.source_url)`,
+  )
+    .bind(m.uid, m.username, now, m.regDate ?? null, m.posts ?? null, m.sourceUrl ?? null)
+    .run();
+}
 
-// Resolve an exact username to a member via Flashback's PUBLIC member search: sok/?query=p:<name>
-// 302-redirects to the profile /uNNN on an exact match. We read the redirect (don't follow),
-// take the canonical username from the public profile <title>, cache the fact, and return it.
-// Returns null on no exact match or any upstream hiccup. Facts only — no content.
+// Resolve an exact username via Flashback's PUBLIC member search: sok/?query=p:<name> 302-redirects
+// to the profile /uNNN on an exact match. Bytes cross the normalizer; we parse UTF-8 facts only.
+// Returns null on no exact match or any upstream hiccup.
 async function resolveMemberUpstream(
   q: string,
   env: Env,
 ): Promise<{ uid: string; username: string; avg_hs: number | null; cnt: number } | null> {
   try {
-    const sres = await fetch(
+    const search = await fetchFlashback(
       'https://www.flashback.org/sok/?query=' + encodeURIComponent('p:' + q),
-      { headers: { 'User-Agent': UA }, redirect: 'manual' },
+      { redirect: 'manual' },
     );
-    const loc = sres.headers.get('Location') ?? '';
-    const um = loc.match(/\/u(\d+)/);
+    const um = (search.location ?? '').match(/\/u(\d+)/);
     if (!um) return null;
     const uid = um[1];
-    const pres = await fetch('https://www.flashback.org/u' + uid, { headers: { 'User-Agent': UA } });
-    const phtml = new TextDecoder('iso-8859-1').decode(await pres.arrayBuffer());
-    const tm = phtml.match(/Visa profil:\s*([^<]+)</);
+    const profileUrl = 'https://www.flashback.org/u' + uid;
+    const profile = await fetchFlashback(profileUrl);
+    const tm = profile.html.match(/Visa profil:\s*([^<]+)</);
     const username = (tm ? decodeEntities(tm[1]) : q).trim();
     if (!username) return null;
-    // Reg date IS on the public profile ("Reg: <strong>YYYY-MM-DD</strong>"); post count is NOT
-    // (that's only on the gated memberlist), so on-miss captures every public fact but not posts.
-    const rm = phtml.match(/Reg:\s*<strong>(\d{4}-\d{2}-\d{2})<\/strong>/);
-    const regDate = rm ? rm[1] : null;
-    const now = new Date().toISOString();
-    await env.DB.prepare(
-      `INSERT INTO members (uid, username, first_seen, last_seen, reg_date) VALUES (?1, ?2, ?3, ?3, ?4)
-       ON CONFLICT (uid) DO UPDATE SET username = excluded.username, last_seen = excluded.last_seen,
-         reg_date = COALESCE(members.reg_date, excluded.reg_date)`,
-    )
-      .bind(uid, username, now, regDate)
-      .run();
+    // Reg date is in the static profile HTML; post count is public but JS-rendered (not here).
+    const rm = profile.html.match(/Reg:\s*<strong>(\d{4}-\d{2}-\d{2})<\/strong>/);
+    await upsertMember(env, { uid, username, regDate: rm ? rm[1] : null, sourceUrl: profileUrl });
     return { uid, username, avg_hs: null, cnt: 0 };
   } catch {
     return null;
@@ -314,64 +326,57 @@ export default {
       // trust-domain boundary and is deliberately NOT fetched here.) Later this becomes a background
       // job; for now it's an explicit trigger so the fetch/parse pipeline can be run and verified.
       if (path === '/api/preseed/moderators' && request.method === 'POST') {
-        const res = await fetch('https://www.flashback.org/moderatorer', {
-          headers: { 'User-Agent': 'flashbackaren-preseed/0.1 (prototype)' },
-        });
-        if (!res.ok) return json({ error: 'upstream', status: res.status }, setCookie);
-        const html = new TextDecoder('iso-8859-1').decode(await res.arrayBuffer());
+        const page = await fetchFlashback('https://www.flashback.org/moderatorer');
+        if (!page.ok) return json({ error: 'upstream', status: page.status }, setCookie);
         const re = /href="\/u(\d+)"\s+class="bold">([^<]+)<\/a>/g;
-        const now = new Date().toISOString();
         const seen = new Set<string>();
         let upserted = 0;
         let m: RegExpExecArray | null;
-        while ((m = re.exec(html)) !== null) {
+        while ((m = re.exec(page.html)) !== null) {
           const uid = m[1];
           if (uid === '0' || seen.has(uid)) continue;
           seen.add(uid);
           const username = decodeEntities(m[2]).trim();
           if (!username) continue;
-          await env.DB.prepare(
-            `INSERT INTO members (uid, username, first_seen, last_seen) VALUES (?1, ?2, ?3, ?3)
-             ON CONFLICT (uid) DO UPDATE SET username = excluded.username, last_seen = excluded.last_seen`,
-          )
-            .bind(uid, username, now)
-            .run();
+          await upsertMember(env, { uid, username, sourceUrl: 'https://www.flashback.org/u' + uid });
           upserted++;
         }
-        return json({ source: 'moderatorer', upserted }, setCookie);
+        return json({ source: 'moderatorer', upserted, encoding: page.encoding }, setCookie);
       }
 
       // --- Import a memberlist page the operator exported while logged in. The authenticated
       // fetch happens on the human's side (we hold no session); we only parse FACTS (UID, username,
       // reg date, post count) out of the posted HTML and drop everything else (avatars etc.).
       if (path === '/api/preseed/memberlist' && request.method === 'POST') {
-        const htmlBody = await request.text();
+        // The operator uploads saved memberlist HTML; the normalizer yields canonical UTF-8
+        // regardless of whether the browser saved it as UTF-8 (with a stale ISO-8859-1 meta).
+        const page = normalizeBytes(
+          new Uint8Array(await request.arrayBuffer()),
+          'https://www.flashback.org/memberlist.php?do=getall',
+          request.headers.get('Content-Type'),
+        );
         const re =
           /flashback\.org\/u(\d+)\s+class=bold>([^<]+)<\/a>[\s\S]{0,400}?Reg:\s*(\d{4}-\d{2}-\d{2})[\s\S]{0,200}?Inlägg:\s*([^<]+?)</g;
-        const now = new Date().toISOString();
         const seen = new Set<string>();
         let upserted = 0;
         let m: RegExpExecArray | null;
-        while ((m = re.exec(htmlBody)) !== null) {
+        while ((m = re.exec(page.html)) !== null) {
           const uid = m[1];
           if (seen.has(uid)) continue;
           seen.add(uid);
           const username = decodeEntities(m[2]).trim();
-          const regDate = m[3];
-          const posts = parseInt(m[4].replace(/[^\d]/g, ''), 10) || null;
           if (!username) continue;
-          await env.DB.prepare(
-            `INSERT INTO members (uid, username, first_seen, last_seen, posts, reg_date)
-               VALUES (?1, ?2, ?3, ?3, ?4, ?5)
-             ON CONFLICT (uid) DO UPDATE SET
-               username = excluded.username, last_seen = excluded.last_seen,
-               posts = excluded.posts, reg_date = excluded.reg_date`,
-          )
-            .bind(uid, username, now, posts, regDate)
-            .run();
+          const posts = parseInt(m[4].replace(/[^\d]/g, ''), 10) || null;
+          await upsertMember(env, {
+            uid,
+            username,
+            regDate: m[3],
+            posts,
+            sourceUrl: 'https://www.flashback.org/u' + uid,
+          });
           upserted++;
         }
-        return json({ source: 'memberlist', upserted }, setCookie);
+        return json({ source: 'memberlist', upserted, encoding: page.encoding }, setCookie);
       }
 
       // --- The see-and-feel front end.

@@ -5,11 +5,24 @@ major: v1
 fork: F0
 governs:
   - src/worker.ts
+  - src/flashback.ts
   - migrations/0002_seed_demo.sql
   - migrations/0004_member_facts.sql
+  - migrations/0005_member_source.sql
 ---
 
 # Member index — agent contract
+
+> **Encoding boundary (2026-09-06):** ALL Flashback bytes cross exactly one boundary — the
+> **FlashbackNormalizer** (`src/flashback.ts`) — which detects the encoding *per response*
+> (HTTP charset → BOM → UTF-8 validity sniff → `<meta>` → ISO-8859-1 fallback) and yields canonical
+> UTF-8 + source metadata (encoding, source URL). Everything downstream (parsers, API, storage)
+> assumes UTF-8 and never decodes bytes itself. This fixes the class of bug behind the earlier
+> mojibake/"posts not public" mistakes. The sniff is what makes live latin1 pages AND browser-saved
+> UTF-8 pages (that still carry a stale ISO-8859-1 `<meta>`) both decode correctly — verified live
+> (moderators=iso-8859-1, memberlist=utf-8, mojibake=0) and by fixtures in `src/flashback.test.ts`.
+> Members carry a `source_url` (canonical profile URL) for debuggability. The adapter is meant to be
+> reused later by thread search, batch jobs, and companion features.
 
 > **Real cold-boot preseed (built 2026-09-06):** `POST /api/preseed/moderators` fetches
 > Flashback's **public** moderators page, decodes it (ISO-8859-1), parses `/uNNN` + username, and
