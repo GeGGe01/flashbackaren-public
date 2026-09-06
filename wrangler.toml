@@ -2,6 +2,13 @@ name = "flashbackaren-prototyp"
 main = "src/worker.ts"
 compatibility_date = "2026-09-01"
 
+# Production mount: served under a path route on the gegge.se zone (typ.gegge.se/flashbackaren),
+# to sidestep the platform-side 1050 edge block on shared workers.dev. The worker strips the
+# BASE_PATH prefix (see normalizeBase/mountRelativePath) so the app routes work under the subpath.
+routes = [
+  { pattern = "typ.gegge.se/flashbackaren*", zone_name = "gegge.se" }
+]
+
 # v1-core see-and-feel slice. Runs fully local via `wrangler dev` (miniflare emulates D1) —
 # no Cloudflare account needed for local dev. The database_id below is the real remote D1
 # id (provisioned by alchemist on the account's flashbackaren-v1 database, 2026-09-06).
@@ -10,3 +17,7 @@ compatibility_date = "2026-09-01"
 binding = "DB"
 database_name = "flashbackaren-v1"
 database_id = "57dff21c-cd39-4f15-9c97-e775bfd93a0e"
+
+# Mount prefix injected into routing + the front end. Must match the route pattern's path above.
+[vars]
+BASE_PATH = "/flashbackaren"
