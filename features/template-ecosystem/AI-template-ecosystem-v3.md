@@ -222,6 +222,38 @@ reputation presentation · 30 existing rating upsert stays atomic with criterion
 Migrations are forward-only: V2 shipped `0007` (already applied to the remote D1), so V3 evolves it via
 `0008` (both local and remote apply 0008 forward) — never rewrite 0007.
 
+## Implementation status (2026-09-07) — A–E + A–E.1 + A–E.2 hardening, returned for review before F
+
+**A–E.2 (final backend hardening) applied** on `feat/template-ecosystem-v3`:
+- **Type-strict validation** — no `Number()`/`String()` coercion of API JSON; numeric/integer/boolean
+  fields checked by `typeof`. `{value:null}`, `{value:"4.5"}`, `weight_milli:"1000"`,
+  `default_active:"false"`, ordinal `index:"0"`, `min:null` all rejected.
+- **Unknown `calculation.kind` rejected** (no silent fallback to native); expression still fails closed.
+- **0008 migrates ALL V2 rows generically** — preserves ownership (`author_identity` →
+  `author_identity_id`, not 'system'), tier (from the work's latest version), `current_version_id`,
+  genealogy, and criterion weights (`weight_default` → `default_weight_milli`, e.g. 2.5 → 2500).
+  Only the system Standard is re-owned to 'system'. Community versions land with NULL hashes.
+- **Deterministic hash backfill** — `POST /api/admin/backfill-hashes` (operator-gated) computes
+  snapshot/logic hashes for NULL-hash versions with the SAME `src/template.ts` impl. After migration +
+  backfill: **0 published versions with NULL hashes**.
+- **Full structured diff** — `GET /api/template-versions/:id/diff` → `{version:{…}, criteria:[…]}`;
+  version-level (name/description/calculation_config/presentation_config) + all criterion fields
+  (label/description/type/position/default_active/default_weight_milli/scoring_config/presentation_config).
+- **Read model** — `GET /api/templates/:templateId` (work + current_version + uses/forks + version history).
+- **Direct rating half-step only** — `stars` must be 0..5 with `stars*2` integer (4.5 ok, 4.37 → 400).
+- **Global aggregation at full precision** — B and R = min(5, B+0.1P) computed unrounded; rounding
+  applied only to response fields (display precision left open).
+- **V2 legacy isolated** in `src/template.ts` (banner: legacy vs V3-authoritative); `typescript` added
+  as a devDependency + `tsconfig.json` so `npm ci && npm test && npm run typecheck` works clean.
+
+**Verification:** 76 unit tests + `tsc --noEmit` clean. Fresh 0001→0008: no NULL-hash versions.
+**Synthetic V2 fixture** (community root + fork, author alice/bob, weight 2.5): 0007→0008 preserved
+ownership (alice/bob, not system), tier, current_version, genealogy, weight→2500; post-backfill 0
+NULL hashes. Endpoint acceptance: detail, structured diff, direct 4.37→400/4.5→200, archived→409.
+**Remote preflight (read-only):** the remote D1 `template` table contains ONLY `tpl-standard`
+(author 'system') — no V2 community rows — so remote migration is low-risk (Standard's hash is
+hardcoded; backfill is a no-op there).
+
 ## Implementation status (2026-09-07) — A–E BUILT, returned for review before F
 
 Batches **A–E are implemented + verified locally** on branch `feat/template-ecosystem-v3`:

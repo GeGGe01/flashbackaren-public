@@ -1,11 +1,15 @@
-// Template-ecosystem V2 domain helpers (see features/template-ecosystem/AI-template-ecosystem.md,
-// "V2 domain model — FROZEN"). The load-bearing rule: template IDENTITY ≠ template VERSION. A
-// template is a *work*; a version is an *immutable* snapshot. Ratings and forks bind to a VERSION,
-// never to the mutable work, so genealogy can't start lying as a work keeps evolving.
+// Template-ecosystem hashing + shared constants.
+//
+// ┌───────────────────────────────────────────────────────────────────────────────────────────────┐
+// │ LEGACY V2 — DO NOT USE FOR V3 PUBLICATION.                                                       │
+// │ canonicalString / canonicalHash / validateCriteria / VersionCriterion are the SUPERSEDED V2      │
+// │ single-hash model. They are retained ONLY because migration 0007's seed-hash test references     │
+// │ them. V3 publication uses snapshotHash / logicHash (below) — the dual-hash authoritative path.    │
+// │ The authoritative product contract is AI-template-ecosystem-v3.md; AI-template-ecosystem.md's     │
+// │ "V2 FROZEN" section is superseded.                                                                │
+// └───────────────────────────────────────────────────────────────────────────────────────────────┘
 
-// One criterion slot on a specific template version: which stable criterion, at what position,
-// with what default weight. `label` lives here (per version), NOT on the criterion — so renaming a
-// label is a new version's join row with the SAME criterion_id (criterion identity survives).
+// [V2 LEGACY] One criterion slot (V2 shape). Superseded by the V3 SlotForHash below.
 export interface VersionCriterion {
   criterion_id: string;
   label: string;

@@ -95,7 +95,7 @@ async function upsertMember(
 // to the profile /uNNN on an exact match. Bytes cross the normalizer; we parse UTF-8 facts only.
 // Distinguishes NOT_FOUND (no exact match) from ERROR (upstream/rate-limit/parse failure) internally,
 // so an error is never cached as a miss; the external API response stays minimal regardless.
-type MemberRow = { uid: string; username: string; avg_hs: number | null; cnt: number };
+type MemberRow = { uid: string; username: string; avg_bp: number | null; cnt: number };
 type ResolveResult = { status: 'found'; member: MemberRow } | { status: 'not_found' } | { status: 'error' };
 async function resolveMemberUpstream(q: string, env: Env): Promise<ResolveResult> {
   let search;
@@ -119,7 +119,7 @@ async function resolveMemberUpstream(q: string, env: Env): Promise<ResolveResult
     // Reg date is in the static profile HTML; post count is public but JS-rendered (not here).
     const rm = profile.html.match(/Reg:\s*<strong>(\d{4}-\d{2}-\d{2})<\/strong>/);
     await upsertMember(env, { uid, username, regDate: rm ? rm[1] : null, sourceUrl: profileUrl });
-    return { status: 'found', member: { uid, username, avg_hs: null, cnt: 0 } };
+    return { status: 'found', member: { uid, username, avg_bp: null, cnt: 0 } };
   } catch {
     return { status: 'error' };
   }
@@ -367,13 +367,15 @@ function parseSlots(input: SlotInput[], lineageIds: Set<string>): SlotParse {
     // Validate + canonicalize the scoring_config for this type (no arbitrary JSON persisted).
     const scfg = validateScoringConfig(type as CriterionType, c.scoring_config ?? (type === 'scale' || type === 'bipolar' ? { min: 0, max: 5, step: 0.5 } : {}));
     if (!scfg.ok) return { ok: false, why: `scoring_config: ${scfg.error}` };
+    // default_active: boolean only (reject "false" the string etc.); defaults true when omitted.
+    if (c.default_active !== undefined && typeof c.default_active !== 'boolean') return { ok: false, why: 'default_active must be a boolean' };
     slots.push({
       criterion_id: cid,
       label,
       description: description || null,
       type,
       position: i + 1,
-      default_active: c.default_active !== false,
+      default_active: c.default_active === undefined ? true : c.default_active,
       default_weight_milli: wv.value,
       scoring_config: scfg.value,
       // Per-criterion presentation config: server default only until F's schema is finalized (P0-6).
@@ -806,6 +808,47 @@ export default {
         return json({ ok: true, template_id: templateId, tier }, setCookie);
       }
 
+      // --- Operator-only: backfill snapshot_hash/logic_hash for any published version missing them
+      // (V2 community rows migrated by 0008 land with NULL hashes). Deterministic — uses the SAME
+      // snapshotHash/logicHash as runtime publication. Idempotent; run once after a V2→V3 migration.
+      if (path === '/api/admin/backfill-hashes' && request.method === 'POST') {
+        if (!isAdmin(request, env)) return forbidden(setCookie);
+        const missing = await env.DB.prepare(
+          `SELECT id FROM template_version WHERE snapshot_hash IS NULL OR logic_hash IS NULL`,
+        ).all<{ id: string }>();
+        let backfilled = 0;
+        for (const row of missing.results) {
+          const ver = await loadVersion(env, row.id);
+          if (!ver) continue;
+          const forHash = {
+            name: ver.name,
+            description: ver.description ?? '',
+            calculation_config: ver.calculation_config,
+            presentation_config: ver.presentation_config,
+            criteria: ver.criteria.map((c) => ({
+              criterion_id: c.id,
+              label: c.label,
+              description: c.description,
+              type: c.type,
+              position: c.position,
+              default_active: c.default_active,
+              default_weight_milli: c.default_weight_milli,
+              scoring_config: c.scoring_config,
+              presentation_config: c.presentation_config,
+            })),
+          };
+          const snapshot = await snapshotHash(forHash);
+          const logic = await logicHash(forHash);
+          await env.DB.prepare(
+            `UPDATE template_version SET snapshot_hash = ?1, logic_hash = ?2 WHERE id = ?3`,
+          )
+            .bind(snapshot, logic, row.id)
+            .run();
+          backfilled++;
+        }
+        return json({ ok: true, backfilled }, setCookie);
+      }
+
       // --- A single template version (its criteria + config), addressable forever.
       if (path.startsWith('/api/template-versions/') && !path.endsWith('/diff') && request.method === 'GET') {
         const versionId = path.slice('/api/template-versions/'.length);
@@ -814,38 +857,102 @@ export default {
         return json(ver, setCookie);
       }
 
-      // --- Deterministic diff of a version against its parent (rename/config-change vs add/remove,
-      // keyed on the stable criterion_id).
+      // --- Deterministic diff of a version against its parent — full semantic snapshot: version-level
+      // (name/description/calculation_config/presentation_config) + every criterion field, keyed on the
+      // stable criterion_id (modified vs added/removed). Broadly explains why snapshot_hash changed.
       if (path.startsWith('/api/template-versions/') && path.endsWith('/diff') && request.method === 'GET') {
         const versionId = path.slice('/api/template-versions/'.length, -'/diff'.length);
         const ver = await loadVersion(env, versionId);
         if (!ver) return json({ error: 'not_found' }, setCookie, 404);
-        const parentId = await env.DB.prepare(`SELECT parent_version_id FROM template_version WHERE id = ?1`)
-          .bind(versionId)
-          .first<{ parent_version_id: string | null }>();
-        const parent = parentId?.parent_version_id ? await loadVersion(env, parentId.parent_version_id) : null;
+        const parent = ver.parent_version_id ? await loadVersion(env, ver.parent_version_id) : null;
+        const sameJson = (a: unknown, b: unknown) => JSON.stringify(a) === JSON.stringify(b);
+        const version: Record<string, unknown> = {};
+        if (parent) {
+          if (parent.name !== ver.name) version.name = { from: parent.name, to: ver.name };
+          if ((parent.description ?? '') !== (ver.description ?? ''))
+            version.description = { from: parent.description, to: ver.description };
+          if (!sameJson(parent.calculation_config, ver.calculation_config))
+            version.calculation_config = { from: parent.calculation_config, to: ver.calculation_config };
+          if (!sameJson(parent.presentation_config, ver.presentation_config))
+            version.presentation_config = { from: parent.presentation_config, to: ver.presentation_config };
+        }
         const before = new Map((parent?.criteria ?? []).map((c) => [c.id, c]));
         const after = new Map(ver.criteria.map((c) => [c.id, c]));
-        const changes: Record<string, unknown>[] = [];
+        const criteria: Record<string, unknown>[] = [];
         for (const [id, a] of after) {
           const b = before.get(id);
           if (!b) {
-            changes.push({ criterion_id: id, change: 'added', label: a.label });
-          } else {
-            const diffs: Record<string, unknown> = {};
-            if (b.label !== a.label) diffs.label = { from: b.label, to: a.label };
-            if (b.default_weight_milli !== a.default_weight_milli)
-              diffs.weight_milli = { from: b.default_weight_milli, to: a.default_weight_milli };
-            if (b.type !== a.type) diffs.type = { from: b.type, to: a.type };
-            if (b.position !== a.position) diffs.position = { from: b.position, to: a.position };
-            if (Object.keys(diffs).length) changes.push({ criterion_id: id, change: 'modified', ...diffs });
+            criteria.push({ criterion_id: id, change: 'added', label: a.label });
+            continue;
           }
+          const fields: Record<string, unknown> = {};
+          if (a.label !== b.label) fields.label = { from: b.label, to: a.label };
+          if ((a.description ?? '') !== (b.description ?? '')) fields.description = { from: b.description, to: a.description };
+          if (a.type !== b.type) fields.type = { from: b.type, to: a.type };
+          if (a.position !== b.position) fields.position = { from: b.position, to: a.position };
+          if (a.default_active !== b.default_active) fields.default_active = { from: b.default_active, to: a.default_active };
+          if (a.default_weight_milli !== b.default_weight_milli)
+            fields.default_weight_milli = { from: b.default_weight_milli, to: a.default_weight_milli };
+          if (!sameJson(a.scoring_config, b.scoring_config)) fields.scoring_config = { from: b.scoring_config, to: a.scoring_config };
+          if (!sameJson(a.presentation_config, b.presentation_config))
+            fields.presentation_config = { from: b.presentation_config, to: a.presentation_config };
+          if (Object.keys(fields).length) criteria.push({ criterion_id: id, change: 'modified', fields });
         }
         for (const [id, b] of before) {
-          if (!after.has(id)) changes.push({ criterion_id: id, change: 'removed', label: b.label });
+          if (!after.has(id)) criteria.push({ criterion_id: id, change: 'removed', label: b.label });
         }
+        return json({ version_id: versionId, parent_version_id: ver.parent_version_id, version, criteria }, setCookie);
+      }
+
+      // --- Template detail read-model (P1): the work + its current version + stats + version history.
+      // One call feeds the F detail/history/genealogy/compare/edit/fork/old-version surfaces.
+      if (
+        path.startsWith('/api/templates/') &&
+        !path.endsWith('/versions') &&
+        !path.endsWith('/archive') &&
+        !path.endsWith('/tier') &&
+        request.method === 'GET'
+      ) {
+        const templateId = path.slice('/api/templates/'.length);
+        const t = await env.DB.prepare(
+          `SELECT id, root_template_id, author_identity_id, tier, status, created_at, current_version_id
+             FROM template WHERE id = ?1`,
+        )
+          .bind(templateId)
+          .first<Record<string, string>>();
+        if (!t) return json({ error: 'not_found' }, setCookie, 404);
+        const current = t.current_version_id ? await loadVersion(env, t.current_version_id) : null;
+        const uses = await env.DB.prepare(
+          `SELECT COUNT(*) AS n FROM ratings r JOIN template_version tv ON tv.id = r.template_version_id WHERE tv.template_id = ?1`,
+        )
+          .bind(templateId)
+          .first<{ n: number }>();
+        const forks = await env.DB.prepare(
+          `SELECT COUNT(*) AS n FROM template_version child JOIN template_version parent ON parent.id = child.parent_version_id
+             WHERE child.version_no = 1 AND parent.template_id = ?1`,
+        )
+          .bind(templateId)
+          .first<{ n: number }>();
+        const versions = await env.DB.prepare(
+          `SELECT id AS version_id, version_no, parent_version_id, name, change_note, published_at, snapshot_hash, logic_hash
+             FROM template_version WHERE template_id = ?1 ORDER BY version_no`,
+        )
+          .bind(templateId)
+          .all<Record<string, unknown>>();
         return json(
-          { version_id: versionId, parent_version_id: parentId?.parent_version_id ?? null, changes },
+          {
+            template_id: t.id,
+            root_template_id: t.root_template_id,
+            author_identity_id: t.author_identity_id,
+            tier: t.tier,
+            status: t.status,
+            created_at: t.created_at,
+            current_version_id: t.current_version_id,
+            current_version: current,
+            uses: uses?.n ?? 0,
+            forks: forks?.n ?? 0,
+            versions: versions.results,
+          },
           setCookie,
         );
       }
@@ -924,19 +1031,20 @@ export default {
         }
         // Reputation R = min(5, B + 0.1·P): community rating B plus a small activity bump. Activity
         // is a SEPARATE component (not quality) and only applies when there's a community rating.
-        const community = agg?.avg_bp == null ? null : r1(bpToStars(agg.avg_bp)); // B, or null when unrated
+        // The MATHS runs at full precision; display rounding is applied ONLY to the response fields
+        // (P1 — internal formula must not depend on presentation rounding; display precision is an
+        // open question, left as-is here).
         const p = postsPerDay(member.posts, member.reg_date);
-        const activityBonus = p == null ? 0 : r1(ACTIVITY_WEIGHT * p);
-        const reputation =
-          community == null ? null : r1(Math.min(5, community + ACTIVITY_WEIGHT * (p ?? 0)));
+        const communityExact = agg?.avg_bp == null ? null : bpToStars(agg.avg_bp); // B (full precision)
+        const reputationExact = communityExact == null ? null : Math.min(5, communityExact + ACTIVITY_WEIGHT * (p ?? 0));
         return json(
           {
             uid: member.uid,
             username: member.username,
-            community,
+            community: communityExact == null ? null : r1(communityExact),
             postsPerDay: p == null ? null : r1(p),
-            activityBonus,
-            reputation,
+            activityBonus: p == null ? 0 : r1(ACTIVITY_WEIGHT * p),
+            reputation: reputationExact == null ? null : r1(reputationExact),
             posts: member.posts,
             regDate: member.reg_date,
             count: agg?.cnt ?? 0,
@@ -1051,12 +1159,18 @@ export default {
         } else {
           mode = 'direct';
           if (body.stars != null) {
-            const s = Number(body.stars);
-            if (!Number.isFinite(s) || s < 0 || s > 5) return json({ error: 'bad_request' }, setCookie, 400);
+            const s = body.stars;
+            // Direct input is HALF-STAR only (0..5, step 0.5): 4.5 ok, 4.37 rejected. Rich calculation
+            // is where finer precision comes from — direct must stay on the half-star grid.
+            if (typeof s !== 'number' || !Number.isFinite(s) || s < 0 || s > 5 || !Number.isInteger(s * 2)) {
+              return json({ error: 'bad_request', why: 'stars must be 0..5 in half-star steps' }, setCookie, 400);
+            }
             scoreBp = Math.round(s * (BP_MAX / 5)); // 4.5 → 9000
           } else {
-            const hs = Number(body.halfsteps);
-            if (!Number.isInteger(hs) || hs < 0 || hs > 10) return json({ error: 'bad_request' }, setCookie, 400);
+            const hs = body.halfsteps;
+            if (typeof hs !== 'number' || !Number.isInteger(hs) || hs < 0 || hs > 10) {
+              return json({ error: 'bad_request', why: 'halfsteps must be an integer 0..10' }, setCookie, 400);
+            }
             scoreBp = hs * 1000;
           }
         }

@@ -53,6 +53,10 @@ export interface CalculationConfig {
 const clampBp = (n: number): number => Math.max(0, Math.min(BP_MAX, Math.round(n)));
 const isFiniteNum = (n: unknown): n is number => typeof n === 'number' && Number.isFinite(n);
 const isBp = (n: unknown): n is number => isFiniteNum(n) && n >= 0 && n <= BP_MAX && Number.isInteger(n);
+const isInt = (n: unknown): n is number => typeof n === 'number' && Number.isInteger(n);
+const isBool = (b: unknown): b is boolean => typeof b === 'boolean';
+// API JSON is validated by TYPE, never coerced (P0). No Number(...)/String(...) on untyped input:
+// Number(null)=0, Number('4.5')=4.5 etc. would let malformed JSON become a real score.
 
 // ---- Config validation + canonicalization (only supported fields survive; P0-5/6). ----
 export function validateScoringConfig(type: CriterionType, cfg: unknown): Valid<ScoringConfig> {
@@ -60,15 +64,14 @@ export function validateScoringConfig(type: CriterionType, cfg: unknown): Valid<
   switch (type) {
     case 'scale':
     case 'bipolar': {
-      const min = Number(c.min);
-      const max = Number(c.max);
-      if (!isFiniteNum(min) || !isFiniteNum(max)) return err(`${type}: min/max must be finite`);
+      if (!isFiniteNum(c.min) || !isFiniteNum(c.max)) return err(`${type}: min/max must be finite numbers`);
+      const min = c.min as number;
+      const max = c.max as number;
       if (max <= min) return err(`${type}: max must be > min`);
       const out: ScaleConfig = { min, max };
       if (c.step !== undefined) {
-        const step = Number(c.step);
-        if (!isFiniteNum(step) || step <= 0) return err(`${type}: step must be > 0`);
-        out.step = step;
+        if (!isFiniteNum(c.step) || (c.step as number) <= 0) return err(`${type}: step must be a number > 0`);
+        out.step = c.step as number;
       }
       return ok(out);
     }
@@ -91,7 +94,8 @@ export function validateScoringConfig(type: CriterionType, cfg: unknown): Valid<
       const labels = new Set<string>();
       const clean: OrdinalOption[] = [];
       for (const o of options) {
-        const label = String(o.label ?? '').trim();
+        if (typeof o.label !== 'string') return err('ordinal: option label must be a string');
+        const label = o.label.trim();
         if (!label || label.length > ORDINAL_LABEL_MAX) return err('ordinal: bad option label');
         if (labels.has(label)) return err('ordinal: duplicate option label');
         labels.add(label);
@@ -118,8 +122,8 @@ export function validateRawValue(
     case 'scale':
     case 'bipolar': {
       const c = cfg as ScaleConfig;
-      const value = Number(r.value);
-      if (!isFiniteNum(value)) return err(`${type}: value must be a finite number`);
+      if (!isFiniteNum(r.value)) return err(`${type}: value must be a finite number`);
+      const value = r.value as number;
       if (value < c.min || value > c.max) return err(`${type}: value out of [${c.min}, ${c.max}]`);
       if (c.step) {
         // Must lie on the configured grid (tolerate float noise).
@@ -130,20 +134,16 @@ export function validateRawValue(
     }
     case 'boolean': {
       const c = cfg as BooleanConfig;
-      let v: boolean;
-      if (r.value === true || r.value === false) v = r.value as boolean;
-      else if (r.value === 'true') v = true;
-      else if (r.value === 'false') v = false;
-      else return err('boolean: value must be a boolean');
+      if (!isBool(r.value)) return err('boolean: value must be a boolean');
+      const v = r.value;
       return ok({ normalized_bp: clampBp(v ? c.true_bp ?? BP_MAX : c.false_bp ?? 0), canonical_raw: { value: v } });
     }
     case 'ordinal': {
       const c = cfg as OrdinalConfig;
       let opt: OrdinalOption | undefined;
       if (r.index !== undefined) {
-        const idx = Number(r.index);
-        if (!Number.isInteger(idx) || idx < 0 || idx >= c.options.length) return err('ordinal: index out of range');
-        opt = c.options[idx];
+        if (!isInt(r.index) || r.index < 0 || r.index >= c.options.length) return err('ordinal: index out of range');
+        opt = c.options[r.index];
       } else if (typeof r.value === 'string') {
         opt = c.options.find((o) => o.label === r.value);
         if (!opt) return err('ordinal: unknown option label');
@@ -153,8 +153,8 @@ export function validateRawValue(
       return ok({ normalized_bp: clampBp(opt.score_bp), canonical_raw: { value: opt.label } });
     }
     case 'percentage': {
-      const value = Number(r.value);
-      if (!isFiniteNum(value)) return err('percentage: value must be a finite number');
+      if (!isFiniteNum(r.value)) return err('percentage: value must be a finite number');
+      const value = r.value as number;
       if (value < 0 || value > 100) return err('percentage: value out of [0, 100]');
       return ok({ normalized_bp: clampBp(value * 100), canonical_raw: { value } });
     }
@@ -197,36 +197,35 @@ export function normalize(type: CriterionType, cfg: ScoringConfig, raw: any): nu
 // ---- Calculation-config validation (P0-5). criterionIds = ids present in THIS version. ----
 export function validateCalculationConfig(cfg: unknown, criterionIds: Set<string>): Valid<CalculationConfig> {
   const c = (cfg ?? {}) as Record<string, unknown>;
-  const kind = c.kind === 'expression' ? 'expression' : 'native';
-  if (kind === 'expression') {
+  // kind must be EXACTLY 'native' or 'expression' — unknown kinds reject (never default to native).
+  if (c.kind !== undefined && c.kind !== 'native' && c.kind !== 'expression') return err('unknown calculation kind');
+  if (c.kind === 'expression') {
     // Schema may carry it, but the engine does not exist — never silently evaluate as weighted_mean.
     return err('expression calculation is not supported yet');
   }
   const aggregator = (c.aggregator ?? 'weighted_mean') as Aggregator;
-  if (!AGGREGATORS.includes(aggregator)) return err('unknown aggregator');
+  if (typeof aggregator !== 'string' || !AGGREGATORS.includes(aggregator)) return err('unknown aggregator');
   const modsIn = Array.isArray(c.modifiers) ? (c.modifiers as Record<string, unknown>[]) : [];
   const modifiers: Modifier[] = [];
   for (const m of modsIn) {
     if (m.kind === 'threshold') {
-      const min_bp = m.min_bp === undefined ? undefined : Number(m.min_bp);
-      const max_bp = m.max_bp === undefined ? undefined : Number(m.max_bp);
-      if (min_bp !== undefined && !isBp(min_bp)) return err('threshold: min_bp 0..10000');
-      if (max_bp !== undefined && !isBp(max_bp)) return err('threshold: max_bp 0..10000');
+      if (m.min_bp !== undefined && !isBp(m.min_bp)) return err('threshold: min_bp must be an integer 0..10000');
+      if (m.max_bp !== undefined && !isBp(m.max_bp)) return err('threshold: max_bp must be an integer 0..10000');
+      const min_bp = m.min_bp as number | undefined;
+      const max_bp = m.max_bp as number | undefined;
       if (min_bp !== undefined && max_bp !== undefined && min_bp > max_bp) return err('threshold: min > max');
       modifiers.push({ kind: 'threshold', ...(min_bp !== undefined ? { min_bp } : {}), ...(max_bp !== undefined ? { max_bp } : {}) });
     } else if (m.kind === 'cap') {
-      const criterion_id = String(m.criterion_id ?? '');
-      if (!criterionIds.has(criterion_id)) return err('cap: criterion_id not in this version');
-      if (!isBp(m.below_bp)) return err('cap: below_bp 0..10000');
-      if (!isBp(m.cap_bp)) return err('cap: cap_bp 0..10000');
-      modifiers.push({ kind: 'cap', criterion_id, below_bp: m.below_bp as number, cap_bp: m.cap_bp as number });
+      if (typeof m.criterion_id !== 'string' || !criterionIds.has(m.criterion_id)) return err('cap: criterion_id not in this version');
+      if (!isBp(m.below_bp)) return err('cap: below_bp must be an integer 0..10000');
+      if (!isBp(m.cap_bp)) return err('cap: cap_bp must be an integer 0..10000');
+      modifiers.push({ kind: 'cap', criterion_id: m.criterion_id, below_bp: m.below_bp as number, cap_bp: m.cap_bp as number });
     } else if (m.kind === 'veto') {
-      const criterion_id = String(m.criterion_id ?? '');
-      if (!criterionIds.has(criterion_id)) return err('veto: criterion_id not in this version');
-      const below_bp = m.below_bp === undefined ? undefined : Number(m.below_bp);
-      if (below_bp !== undefined && !isBp(below_bp)) return err('veto: below_bp 0..10000');
-      if (below_bp === undefined && m.equals_raw === undefined) return err('veto: below_bp or equals_raw required');
-      modifiers.push({ kind: 'veto', criterion_id, ...(below_bp !== undefined ? { below_bp } : {}), ...(m.equals_raw !== undefined ? { equals_raw: m.equals_raw } : {}) });
+      if (typeof m.criterion_id !== 'string' || !criterionIds.has(m.criterion_id)) return err('veto: criterion_id not in this version');
+      if (m.below_bp !== undefined && !isBp(m.below_bp)) return err('veto: below_bp must be an integer 0..10000');
+      if (m.below_bp === undefined && m.equals_raw === undefined) return err('veto: below_bp or equals_raw required');
+      const below_bp = m.below_bp as number | undefined;
+      modifiers.push({ kind: 'veto', criterion_id: m.criterion_id, ...(below_bp !== undefined ? { below_bp } : {}), ...(m.equals_raw !== undefined ? { equals_raw: m.equals_raw } : {}) });
     } else {
       return err(`unknown modifier kind: ${String(m.kind)}`);
     }
@@ -235,9 +234,8 @@ export function validateCalculationConfig(cfg: unknown, criterionIds: Set<string
 }
 
 export function validateWeightMilli(w: unknown): Valid<number> {
-  const n = Number(w);
-  if (!Number.isInteger(n) || n < 0 || n > MAX_WEIGHT_MILLI) return err('weight_milli must be an integer 0..MAX');
-  return ok(n);
+  if (!isInt(w) || w < 0 || w > MAX_WEIGHT_MILLI) return err('weight_milli must be an integer 0..MAX');
+  return ok(w);
 }
 
 // ---- Aggregation of the SCORING set (weight==0 already excluded by the caller). ----

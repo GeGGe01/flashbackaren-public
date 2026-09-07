@@ -266,3 +266,29 @@ describe('validateWeightMilli bounds (P0-7)', () => {
     expect(validateWeightMilli(2.5).ok).toBe(false);
   });
 });
+
+describe('P0: type-strict validation (no JS coercion)', () => {
+  const scale = { min: 0, max: 5, step: 0.5 };
+  it('scale value null / numeric-string / empty-string rejected', () => {
+    expect(validateRawValue('scale', scale, { value: null }).ok).toBe(false);
+    expect(validateRawValue('scale', scale, { value: '4.5' }).ok).toBe(false);
+    expect(validateRawValue('scale', scale, { value: '' }).ok).toBe(false);
+  });
+  it('weight_milli null / string rejected', () => {
+    expect(validateWeightMilli(null).ok).toBe(false);
+    expect(validateWeightMilli('1000').ok).toBe(false);
+  });
+  it('ordinal index as string rejected', () => {
+    const cfg = { options: [{ label: 'A', score_bp: 0 }] };
+    expect(validateRawValue('ordinal', cfg, { index: '0' }).ok).toBe(false);
+  });
+  it('boolean string "false" rejected (only real booleans)', () => {
+    expect(validateRawValue('boolean', {}, { value: 'false' }).ok).toBe(false);
+  });
+  it('scoring config min:null rejected', () => {
+    expect(validateScoringConfig('scale', { min: null, max: 5 }).ok).toBe(false);
+  });
+  it('unknown calculation kind rejected (not silently native)', () => {
+    expect(validateCalculationConfig({ kind: 'garbage', aggregator: 'weighted_mean' }, new Set()).ok).toBe(false);
+  });
+});

@@ -45,12 +45,15 @@ ALTER TABLE template_criterion ADD COLUMN scoring_config TEXT;      -- JSON per 
 ALTER TABLE template_criterion ADD COLUMN presentation_config TEXT; -- JSON
 
 -- 4. Backfill the Standard version's V3 fields + the work's tier/author/current version.
--- The snapshot_hash/logic_hash literals below are precomputed with the SAME implementation as
--- src/template.ts (snapshotHash/logicHash over loadVersion()'s shape of this exact seed) so the
--- migrated Standard version carries valid dual hashes like every published version (P0-8). A unit
--- test (src/template.test.ts) asserts the code reproduces these exact values, catching any drift.
+-- NOTE: 0007 shipped POST /api/templates, so this migration must handle EXISTING V2 community
+-- templates/versions/criteria too — not just the Standard seed. It migrates ALL rows generically and
+-- PRESERVES V2 ownership + weights; only the system Standard is re-owned to 'system'.
+
+-- (a) Standard system seed — dual hashes hardcoded (fresh DBs contain only this row). The literals
+-- are precomputed with the SAME src/template.ts snapshotHash/logicHash over loadVersion()'s shape of
+-- this seed; a unit test asserts the code reproduces them (drift guard, P0-8).
 UPDATE template_version SET
-  name = (SELECT name FROM template WHERE template.id = template_version.template_id),
+  name = 'Standard',
   description = 'Standardmall: kunskap, humor, hjälpsamhet, kvalitet.',
   calculation_config = '{"kind":"native","aggregator":"weighted_mean","modifiers":[]}',
   presentation_config = '{"result":"stars","detail":"bars"}',
@@ -59,19 +62,39 @@ UPDATE template_version SET
   logic_hash = '63a2f1a9417e5a7168dbbb19d4fccd93fdb3fb67591b20cb01dfbd0f819e5271'
 WHERE id = 'tplv-standard-v1';
 
-UPDATE template SET tier = 'standard', status = 'active',
-  author_identity_id = 'system', current_version_id = 'tplv-standard-v1'
-  WHERE id = 'tpl-standard';
--- Any other pre-existing template rows: author defaults to 'system' if it was NULL.
-UPDATE template SET author_identity_id = 'system' WHERE author_identity_id IS NULL;
+-- (b) Every OTHER pre-existing V2 version: fill the V3 structural fields with V2-equivalent semantics
+-- (name denormalised from the V2 template.name; weighted_mean; stars/bars). snapshot_hash/logic_hash
+-- are LEFT NULL and backfilled deterministically AFTER migration by POST /api/admin/backfill-hashes
+-- (same hash impl as runtime publication) — a hardcoded literal cannot cover dynamic community rows.
+UPDATE template_version SET
+  name = COALESCE(name, (SELECT name FROM template WHERE template.id = template_version.template_id)),
+  description = COALESCE(description, ''),
+  calculation_config = COALESCE(calculation_config, '{"kind":"native","aggregator":"weighted_mean","modifiers":[]}'),
+  presentation_config = COALESCE(presentation_config, '{"result":"stars","detail":"bars"}'),
+  change_note = COALESCE(change_note, 'Migrated from V2.')
+WHERE id != 'tplv-standard-v1';
 
--- Standard criteria: 0..5 half-step scales, default weight 1.000, all active.
+-- (c) Every WORK: PRESERVE V2 ownership (author_identity -> author_identity_id, NOT 'system'); tier
+-- from the work's latest 0007 version tier; current_version_id = latest version; status active.
+UPDATE template SET
+  author_identity_id = COALESCE(author_identity_id, author_identity),
+  status = COALESCE(status, 'active'),
+  tier = COALESCE(
+    (SELECT tv.tier FROM template_version tv WHERE tv.template_id = template.id ORDER BY tv.version_no DESC LIMIT 1),
+    tier),
+  current_version_id = COALESCE(
+    current_version_id,
+    (SELECT tv.id FROM template_version tv WHERE tv.template_id = template.id ORDER BY tv.version_no DESC LIMIT 1));
+-- The Standard work is system-owned/canonical (only this one is re-owned).
+UPDATE template SET tier = 'standard', author_identity_id = 'system' WHERE id = 'tpl-standard';
+
+-- (d) Every criterion: typed scale, active, weight PRESERVED from V2 weight_default (e.g. 2.5 -> 2500).
 UPDATE template_criterion SET
-  type = 'scale', default_active = 1,
+  type = COALESCE(type, 'scale'),
+  default_active = COALESCE(default_active, 1),
   default_weight_milli = CAST(ROUND(weight_default * 1000) AS INTEGER),
-  scoring_config = '{"min":0,"max":5,"step":0.5}',
-  presentation_config = '{"kind":"stars"}'
-WHERE template_version_id = 'tplv-standard-v1';
+  scoring_config = COALESCE(scoring_config, '{"min":0,"max":5,"step":0.5}'),
+  presentation_config = COALESCE(presentation_config, '{"kind":"stars"}');
 
 -- 5. ratings: canonical score in basis points + a stable rating id (RatingCriterionValue.rating_id).
 --    score_halfsteps stays for the direct-input representation + the (unchanged) global aggregation.
