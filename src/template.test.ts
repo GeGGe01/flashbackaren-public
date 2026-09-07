@@ -1,5 +1,13 @@
 import { describe, it, expect } from 'vitest';
-import { canonicalString, canonicalHash, validateCriteria, MAX_ACTIVE_CRITERIA } from './template';
+import {
+  canonicalString,
+  canonicalHash,
+  validateCriteria,
+  MAX_ACTIVE_CRITERIA,
+  snapshotHash,
+  logicHash,
+  type VersionForHash,
+} from './template';
 
 const std = [
   { criterion_id: 'crit-knowledge', label: 'Kunskap', position: 1, weight_default: 1 },
@@ -71,5 +79,46 @@ describe('validateCriteria', () => {
   });
   it('rejects an empty label', () => {
     expect(validateCriteria([{ ...std[0], label: '  ' }])).toMatch(/label/);
+  });
+});
+
+describe('V3 dual hashing (snapshot vs logic)', () => {
+  const base: VersionForHash = {
+    name: 'Forumdebattör',
+    description: 'x',
+    calculation_config: { kind: 'native', aggregator: 'weighted_mean', modifiers: [] },
+    presentation_config: { result: 'stars' },
+    criteria: [
+      { criterion_id: 'crit-knowledge', label: 'Kunskap', type: 'scale', position: 1, default_active: true, default_weight_milli: 1000, scoring_config: { min: 0, max: 5 } },
+      { criterion_id: 'crit-humor', label: 'Humor', type: 'scale', position: 2, default_active: true, default_weight_milli: 1000, scoring_config: { min: 0, max: 5 } },
+    ],
+  };
+  // The load-bearing V3 fix: a relabel (same criterion_id) is a NEW published version — snapshot_hash
+  // MUST change, logic_hash MUST NOT (same scoring model, different presentation). Never dedup it away.
+  it('relabel → snapshot_hash changes, logic_hash unchanged', async () => {
+    const relabelled: VersionForHash = {
+      ...base,
+      criteria: [{ ...base.criteria[0], label: 'Ämneskunskap' }, base.criteria[1]],
+    };
+    expect(await snapshotHash(relabelled)).not.toBe(await snapshotHash(base));
+    expect(await logicHash(relabelled)).toBe(await logicHash(base));
+  });
+  it('weight change → BOTH hashes change (it is a scoring difference)', async () => {
+    const heavier: VersionForHash = {
+      ...base,
+      criteria: [{ ...base.criteria[0], default_weight_milli: 2000 }, base.criteria[1]],
+    };
+    expect(await snapshotHash(heavier)).not.toBe(await snapshotHash(base));
+    expect(await logicHash(heavier)).not.toBe(await logicHash(base));
+  });
+  it('is stable + key-order independent', async () => {
+    const reordered: VersionForHash = {
+      criteria: base.criteria,
+      presentation_config: { result: 'stars' },
+      name: 'Forumdebattör',
+      calculation_config: { modifiers: [], aggregator: 'weighted_mean', kind: 'native' },
+      description: 'x',
+    };
+    expect(await snapshotHash(reordered)).toBe(await snapshotHash(base));
   });
 });

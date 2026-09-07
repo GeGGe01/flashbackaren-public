@@ -7,13 +7,22 @@
 // UTF-8 + source metadata. Nothing below decodes upstream bytes itself; parsers assume UTF-8.
 import { fetchFlashback, normalizeBytes } from './flashback';
 import {
-  canonicalHash,
-  validateCriteria,
+  snapshotHash,
+  logicHash,
   MAX_ACTIVE_CRITERIA,
   TIER_RANK,
-  type VersionCriterion,
+  type SlotForHash,
   type Tier,
 } from './template';
+import {
+  evaluate,
+  bpToStars,
+  BP_MAX,
+  type CriterionType,
+  type ScoringConfig,
+  type CalculationConfig,
+  type EvalInput,
+} from './scoring';
 
 // Minimal local shapes so the worker needs no @cloudflare/workers-types dependency.
 interface D1Result<T = Record<string, unknown>> {
@@ -181,6 +190,98 @@ function decodeEntities(s: string): string {
     .replace(/&([a-zA-Z]+);/g, (whole, name) => named[name] ?? whole);
 }
 
+// ---- V3 template helpers (shared by the read + rate endpoints) ----
+// Publication limits (batch E). Configurable constants so they can be loosened later.
+const LIMITS = {
+  name: 60,
+  description: 280,
+  criterionLabel: 48,
+  criterionDescription: 160,
+} as const;
+const CRITERION_TYPES = ['scale', 'boolean', 'ordinal', 'percentage', 'bipolar'];
+
+function parseJson<T>(s: string | null | undefined, fallback: T): T {
+  if (!s) return fallback;
+  try {
+    return JSON.parse(s) as T;
+  } catch {
+    return fallback;
+  }
+}
+
+interface LoadedCriterion {
+  id: string;
+  label: string;
+  description: string | null;
+  type: CriterionType;
+  position: number;
+  default_active: boolean;
+  default_weight_milli: number;
+  scoring_config: ScoringConfig;
+  presentation_config: Record<string, unknown>;
+}
+interface LoadedVersion {
+  version_id: string;
+  template_id: string;
+  name: string;
+  description: string | null;
+  tier: Tier;
+  calculation_config: CalculationConfig;
+  presentation_config: Record<string, unknown>;
+  criteria: LoadedCriterion[];
+}
+
+// Load a template VERSION (default = the current Standard version) with its typed criteria + configs.
+async function loadVersion(env: Env, versionId: string | null): Promise<LoadedVersion | null> {
+  const row = versionId
+    ? await env.DB.prepare(
+        `SELECT tv.id AS version_id, tv.template_id, tv.name, tv.description,
+                tv.calculation_config, tv.presentation_config, t.tier
+           FROM template_version tv JOIN template t ON t.id = tv.template_id WHERE tv.id = ?1`,
+      )
+        .bind(versionId)
+        .first<Record<string, string>>()
+    : await env.DB.prepare(
+        `SELECT tv.id AS version_id, tv.template_id, tv.name, tv.description,
+                tv.calculation_config, tv.presentation_config, t.tier
+           FROM template t JOIN template_version tv ON tv.id = t.current_version_id
+          WHERE t.tier = 'standard' AND t.status = 'active'
+          ORDER BY tv.published_at DESC LIMIT 1`,
+      ).first<Record<string, string>>();
+  if (!row) return null;
+  const crit = await env.DB.prepare(
+    `SELECT criterion_id AS id, label, description, type, position, default_active,
+            default_weight_milli, scoring_config, presentation_config
+       FROM template_criterion WHERE template_version_id = ?1 ORDER BY position`,
+  )
+    .bind(row.version_id)
+    .all<Record<string, unknown>>();
+  return {
+    version_id: row.version_id,
+    template_id: row.template_id,
+    name: row.name,
+    description: row.description ?? null,
+    tier: row.tier as Tier,
+    calculation_config: parseJson<CalculationConfig>(row.calculation_config, {
+      kind: 'native',
+      aggregator: 'weighted_mean',
+      modifiers: [],
+    }),
+    presentation_config: parseJson(row.presentation_config, {}),
+    criteria: crit.results.map((c) => ({
+      id: c.id as string,
+      label: c.label as string,
+      description: (c.description as string) ?? null,
+      type: c.type as CriterionType,
+      position: c.position as number,
+      default_active: !!c.default_active,
+      default_weight_milli: c.default_weight_milli as number,
+      scoring_config: parseJson(c.scoring_config as string, {} as ScoringConfig),
+      presentation_config: parseJson(c.presentation_config as string, {}),
+    })),
+  };
+}
+
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
     const url = new URL(request.url);
@@ -211,8 +312,8 @@ export default {
         const q = (url.searchParams.get('q') ?? '').trim();
         const rows = await env.DB.prepare(
           `SELECT m.uid, m.username,
-                  AVG(r.score_halfsteps) AS avg_hs,
-                  COUNT(r.score_halfsteps) AS cnt
+                  AVG(r.score_bp) AS avg_bp,
+                  COUNT(r.score_bp) AS cnt
              FROM members m
              LEFT JOIN ratings r ON r.target_uid = m.uid
             WHERE m.username LIKE ?1
@@ -221,7 +322,7 @@ export default {
             LIMIT 25`,
         )
           .bind(`%${q}%`)
-          .all<{ uid: string; username: string; avg_hs: number | null; cnt: number }>();
+          .all<{ uid: string; username: string; avg_bp: number | null; cnt: number }>();
         let list = rows.results;
         // Cache-first: on a genuine miss, resolve one exact username upstream (public search) and cache it.
         // Username is OPAQUE upstream data (legacy names break any allowlist), so we only bound length
@@ -234,8 +335,8 @@ export default {
           list.map((m) => ({
             uid: m.uid,
             username: m.username,
-            stars: toStars(m.avg_hs),
-            count: m.cnt,
+            stars: m.avg_bp == null ? null : r1(bpToStars(m.avg_bp)),
+            count: m.cnt ?? 0,
           })),
           setCookie,
         );
@@ -246,48 +347,34 @@ export default {
       // expects back as `template_version_id`. v1 default: the Standard template's latest version.
       if (path === '/api/template' && request.method === 'GET') {
         const wanted = (url.searchParams.get('version') ?? '').trim();
-        const ver = wanted
-          ? await env.DB.prepare(
-              `SELECT tv.id AS version_id, t.name AS name FROM template_version tv
-                 JOIN template t ON t.id = tv.template_id WHERE tv.id = ?1`,
-            )
-              .bind(wanted)
-              .first<{ version_id: string; name: string }>()
-          : await env.DB.prepare(
-              `SELECT tv.id AS version_id, t.name AS name FROM template_version tv
-                 JOIN template t ON t.id = tv.template_id WHERE tv.tier = 'standard'
-                 ORDER BY tv.published_at DESC, tv.version_no DESC LIMIT 1`,
-            ).first<{ version_id: string; name: string }>();
+        const ver = await loadVersion(env, wanted || null);
         if (!ver) return json({ error: 'no_template' }, setCookie);
-        const crit = await env.DB.prepare(
-          `SELECT criterion_id AS id, label, weight_default FROM template_criterion
-             WHERE template_version_id = ?1 ORDER BY position`,
-        )
-          .bind(ver.version_id)
-          .all<{ id: string; label: string; weight_default: number }>();
-        return json({ id: ver.version_id, name: ver.name, criteria: crit.results }, setCookie);
+        // `id` mirrors version_id so both the V3 clients and the current front (which sends `id`
+        // back as template_version_id) work during the transition to the F frontend.
+        return json({ id: ver.version_id, ...ver }, setCookie);
       }
 
       // --- Discovery: all templates (latest version each) with tier + stats, deterministically
       // ordered Standard → Featured → Community, then uses desc, forks desc, published_at. Community
       // junk never dominates; standard/featured (operator-curated) float to the top.
       if (path === '/api/templates' && request.method === 'GET') {
+        // The current version of every ACTIVE template (archived/hidden drop out of discovery).
         const latest = await env.DB.prepare(
-          `SELECT t.id AS template_id, t.name, t.author_identity,
-                  tv.id AS version_id, tv.version_no, tv.tier, tv.published_at,
+          `SELECT t.id AS template_id, t.tier, t.author_identity_id AS author_identity,
+                  tv.id AS version_id, tv.version_no, tv.name, tv.published_at, tv.calculation_config,
                   (SELECT COUNT(*) FROM template_criterion tc WHERE tc.template_version_id = tv.id) AS criteria_count
              FROM template t
-             JOIN template_version tv ON tv.template_id = t.id
-             JOIN (SELECT template_id, MAX(version_no) AS mx FROM template_version GROUP BY template_id) l
-               ON l.template_id = t.id AND l.mx = tv.version_no`,
+             JOIN template_version tv ON tv.id = t.current_version_id
+            WHERE t.status = 'active'`,
         ).all<{
           template_id: string;
-          name: string;
+          tier: Tier;
           author_identity: string;
           version_id: string;
           version_no: number;
-          tier: Tier;
+          name: string;
           published_at: string;
+          calculation_config: string;
           criteria_count: number;
         }>();
         // uses = ratings bound to any version of the template; forks = other templates whose v1
@@ -306,18 +393,22 @@ export default {
         const uses = new Map(usesRows.results.map((r) => [r.tid, r.uses]));
         const forks = new Map(forkRows.results.map((r) => [r.tid, r.forks]));
         const list = latest.results
-          .map((t) => ({
-            template_id: t.template_id,
-            version_id: t.version_id,
-            name: t.name,
-            author: t.author_identity,
-            tier: t.tier,
-            version_no: t.version_no,
-            criteriaCount: t.criteria_count,
-            uses: uses.get(t.template_id) ?? 0,
-            forks: forks.get(t.template_id) ?? 0,
-            published_at: t.published_at,
-          }))
+          .map((t) => {
+            const calc = parseJson<CalculationConfig>(t.calculation_config, { kind: 'native' });
+            return {
+              template_id: t.template_id,
+              version_id: t.version_id,
+              name: t.name,
+              author: t.author_identity,
+              tier: t.tier,
+              version_no: t.version_no,
+              criteriaCount: t.criteria_count,
+              calcType: calc.kind === 'expression' ? 'expression' : calc.aggregator ?? 'weighted_mean',
+              uses: uses.get(t.template_id) ?? 0,
+              forks: forks.get(t.template_id) ?? 0,
+              published_at: t.published_at,
+            };
+          })
           .sort(
             (a, b) =>
               (TIER_RANK[a.tier] ?? 9) - (TIER_RANK[b.tier] ?? 9) ||
@@ -328,114 +419,144 @@ export default {
         return json(list, setCookie);
       }
 
-      // --- Create or fork a template. Body: { name, author_identity?, criteria:[{criterion_id?,
-      // label, position, weight_default}], parent_version_id? }. A parent_version_id makes it a FORK
-      // (new work whose v1 derives from that exact version); otherwise a fresh root template. New
-      // criteria mint a stable criterion id; forks may reuse existing criterion ids to keep lineage.
-      // Canonicalize → dedup: if a version with the same canonical shape already exists, return it
-      // rather than inserting a duplicate (no unbounded growth). New templates are tier=community
-      // (featured/standard are operator-curated only, never set here).
+      // --- Create a root template, or fork an exact version. Body: { name, description?,
+      // parent_version_id?, criteria:[{criterion_id?, label, description?, type?, position?,
+      // default_active?, default_weight_milli?, scoring_config?, presentation_config?}] }.
+      // parent_version_id → FORK (new work whose v1 derives from that exact version). New criteria
+      // mint a server-owned id; a reused id (fork) MUST exist in the source version (no spoofed
+      // lineage). Author is the current meta identity, NEVER the body. New works are tier=community.
+      // NO destructive dedup — publishing always creates; snapshot_hash/logic_hash are recorded for
+      // discovery-level dedup + quotas, never to erase genealogy.
       if (path === '/api/templates' && request.method === 'POST') {
         const body = (await request.json().catch(() => ({}))) as {
           name?: string;
-          author_identity?: string;
+          description?: string;
           parent_version_id?: string;
-          criteria?: { criterion_id?: string; label?: string; position?: number; weight_default?: number }[];
+          criteria?: {
+            criterion_id?: string;
+            label?: string;
+            description?: string;
+            type?: string;
+            position?: number;
+            default_active?: boolean;
+            default_weight_milli?: number;
+            scoring_config?: unknown;
+            presentation_config?: unknown;
+          }[];
         };
         const name = (body.name ?? '').trim();
-        if (!name || name.length > 80) return json({ error: 'bad_request', why: 'name' }, setCookie);
-        const author = (body.author_identity ?? 'anon').trim().slice(0, 80) || 'anon';
-
-        // Resolve/assign criterion ids (mint for brand-new criteria), then validate the set.
-        const input = Array.isArray(body.criteria) ? body.criteria : [];
+        if (!name || name.length > LIMITS.name) return json({ error: 'bad_request', why: 'name' }, setCookie);
+        const description = String(body.description ?? '').slice(0, LIMITS.description);
+        const author = meta; // author from server identity — never the request body (invariant)
         const nowIso = new Date().toISOString();
+
+        // Fork: load the source version so reused criterion ids can be checked against ITS lineage.
+        let parentVersionId: string | null = null;
+        let rootTemplateId: string | null = null;
+        let sourceIds = new Set<string>();
+        if (body.parent_version_id) {
+          const parentVer = await loadVersion(env, String(body.parent_version_id).trim());
+          if (!parentVer) return json({ error: 'bad_request', why: 'unknown parent_version_id' }, setCookie);
+          parentVersionId = parentVer.version_id;
+          const t = await env.DB.prepare(`SELECT root_template_id FROM template WHERE id = ?1`)
+            .bind(parentVer.template_id)
+            .first<{ root_template_id: string }>();
+          rootTemplateId = t?.root_template_id ?? parentVer.template_id;
+          sourceIds = new Set(parentVer.criteria.map((c) => c.id));
+        }
+
+        const input = Array.isArray(body.criteria) ? body.criteria : [];
+        if (input.length < 1 || input.length > MAX_ACTIVE_CRITERIA) {
+          return json({ error: 'bad_request', why: 'criteria count' }, setCookie);
+        }
         const newCriterionIds: string[] = [];
-        const crits: VersionCriterion[] = input.map((c, i) => {
-          let cid = (c.criterion_id ?? '').trim();
-          if (!cid) {
+        const slots: SlotForHash[] = [];
+        const seen = new Set<string>();
+        for (let i = 0; i < input.length; i++) {
+          const c = input[i];
+          let cid = String(c.criterion_id ?? '').trim();
+          if (cid) {
+            // A reused id must belong to the fork source — the client cannot spoof arbitrary lineage.
+            if (!sourceIds.has(cid)) return json({ error: 'bad_request', why: 'criterion_id not in source version' }, setCookie);
+          } else {
             cid = 'crit-' + crypto.randomUUID();
             newCriterionIds.push(cid);
           }
-          return {
+          if (seen.has(cid)) return json({ error: 'bad_request', why: 'duplicate criterion' }, setCookie);
+          seen.add(cid);
+          const label = String(c.label ?? '').trim();
+          if (!label || label.length > LIMITS.criterionLabel) return json({ error: 'bad_request', why: 'label' }, setCookie);
+          const type = String(c.type ?? 'scale');
+          if (!CRITERION_TYPES.includes(type)) return json({ error: 'bad_request', why: 'type' }, setCookie);
+          const wm = Math.round(Number(c.default_weight_milli ?? 1000));
+          if (!Number.isFinite(wm) || wm < 0) return json({ error: 'bad_request', why: 'weight' }, setCookie);
+          slots.push({
             criterion_id: cid,
-            label: String(c.label ?? '').trim(),
-            position: Number.isInteger(c.position) ? (c.position as number) : i + 1,
-            weight_default: Number(c.weight_default ?? 1),
-          };
-        });
-        const bad = validateCriteria(crits);
-        if (bad) return json({ error: 'bad_request', why: bad }, setCookie);
-
-        // Reused criterion ids (on a fork) must actually exist — no injecting arbitrary lineage ids.
-        const reused = crits.map((c) => c.criterion_id).filter((id) => !newCriterionIds.includes(id));
-        if (reused.length) {
-          const found = await env.DB.prepare(
-            `SELECT id FROM criterion WHERE id IN (${reused.map(() => '?').join(',')})`,
-          )
-            .bind(...reused)
-            .all<{ id: string }>();
-          if (found.results.length !== reused.length)
-            return json({ error: 'bad_request', why: 'unknown criterion_id' }, setCookie);
+            label,
+            description: String(c.description ?? '').slice(0, LIMITS.criterionDescription) || null,
+            type,
+            position: i + 1,
+            default_active: c.default_active !== false,
+            default_weight_milli: wm,
+            scoring_config: c.scoring_config ?? (type === 'scale' ? { min: 0, max: 5, step: 0.5 } : {}),
+            presentation_config: c.presentation_config ?? {},
+          });
         }
 
-        // Validate the fork parent exists (if forking) and find its root for genealogy chaining.
-        let parentVersionId: string | null = null;
-        let rootTemplateId: string | null = null;
-        if (body.parent_version_id) {
-          const parent = await env.DB.prepare(
-            `SELECT tv.id AS vid, t.root_template_id AS root FROM template_version tv
-               JOIN template t ON t.id = tv.template_id WHERE tv.id = ?1`,
-          )
-            .bind(body.parent_version_id.trim())
-            .first<{ vid: string; root: string }>();
-          if (!parent) return json({ error: 'bad_request', why: 'unknown parent_version_id' }, setCookie);
-          parentVersionId = parent.vid;
-          rootTemplateId = parent.root;
-        }
+        // Default native calculation + stars presentation (custom calc/presentation come later).
+        const calc = { kind: 'native', aggregator: 'weighted_mean', modifiers: [] };
+        const pres = { result: 'stars', detail: 'bars' };
+        const forHash = { name, description, calculation_config: calc, presentation_config: pres, criteria: slots };
+        const snapshot = await snapshotHash(forHash);
+        const logic = await logicHash(forHash);
 
-        // Canonicalize + dedup at the VERSION level.
-        const hash = await canonicalHash(crits);
-        const dupe = await env.DB.prepare(
-          `SELECT tv.id AS version_id, tv.template_id, t.name FROM template_version tv
-             JOIN template t ON t.id = tv.template_id WHERE tv.canonical_hash = ?1 LIMIT 1`,
-        )
-          .bind(hash)
-          .first<{ version_id: string; template_id: string; name: string }>();
-        if (dupe) {
-          return json(
-            { deduped: true, template_id: dupe.template_id, version_id: dupe.version_id, name: dupe.name },
-            setCookie,
-          );
-        }
-
-        // Insert the new work + its v1 + any new criterion rows + the join, atomically.
         const templateId = 'tpl-' + crypto.randomUUID();
         const versionId = 'tplv-' + crypto.randomUUID();
         const root = rootTemplateId ?? templateId; // a fresh root points at itself
         const writes: D1PreparedStatement[] = [
           env.DB.prepare(
-            `INSERT INTO template (id, root_template_id, name, author_identity, created_at)
-               VALUES (?1, ?2, ?3, ?4, ?5)`,
-          ).bind(templateId, root, name, author, nowIso),
+            // name + author_identity are 0007 vestigial NOT NULL columns kept denormalised; tier/
+            // status/author_identity_id/current_version_id are the authoritative V3 fields.
+            `INSERT INTO template (id, root_template_id, name, author_identity, author_identity_id, tier, status, created_at, current_version_id)
+               VALUES (?1, ?2, ?3, ?4, ?5, 'community', 'active', ?6, ?7)`,
+          ).bind(templateId, root, name, author, author, nowIso, versionId),
           env.DB.prepare(
+            // canonical_hash is a 0007 vestigial NOT NULL column (no default) — set it to snapshot_hash
+            // to satisfy the constraint; V3 reads snapshot_hash/logic_hash, not canonical_hash.
             `INSERT INTO template_version
-               (id, template_id, version_no, parent_version_id, canonical_hash, tier, published_at)
-               VALUES (?1, ?2, 1, ?3, ?4, 'community', ?5)`,
-          ).bind(versionId, templateId, parentVersionId, hash, nowIso),
+               (id, template_id, version_no, parent_version_id, name, description, calculation_config,
+                presentation_config, snapshot_hash, logic_hash, change_note, published_at, canonical_hash)
+               VALUES (?1, ?2, 1, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 'Initial version.', ?10, ?8)`,
+          ).bind(versionId, templateId, parentVersionId, name, description, JSON.stringify(calc), JSON.stringify(pres), snapshot, logic, nowIso),
           ...newCriterionIds.map((cid) =>
             env.DB.prepare(`INSERT INTO criterion (id, created_at) VALUES (?1, ?2)`).bind(cid, nowIso),
           ),
-          ...crits.map((c) =>
+          ...slots.map((s) =>
             env.DB.prepare(
+              // weight_default is a 0007 vestigial NOT NULL column (no default) — set = milli/1000;
+              // V3 reads default_weight_milli.
               `INSERT INTO template_criterion
-                 (template_version_id, criterion_id, label, position, weight_default)
-                 VALUES (?1, ?2, ?3, ?4, ?5)`,
-            ).bind(versionId, c.criterion_id, c.label, c.position, c.weight_default),
+                 (template_version_id, criterion_id, label, description, type, position, default_active,
+                  default_weight_milli, scoring_config, presentation_config, weight_default)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)`,
+            ).bind(
+              versionId,
+              s.criterion_id,
+              s.label,
+              s.description,
+              s.type,
+              s.position,
+              s.default_active ? 1 : 0,
+              s.default_weight_milli,
+              JSON.stringify(s.scoring_config),
+              JSON.stringify(s.presentation_config),
+              s.default_weight_milli / 1000,
+            ),
           ),
         ];
         await env.DB.batch(writes);
         return json(
-          { deduped: false, template_id: templateId, version_id: versionId, name, tier: 'community' },
+          { template_id: templateId, version_id: versionId, name, tier: 'community', snapshot_hash: snapshot },
           setCookie,
         );
       }
@@ -450,36 +571,71 @@ export default {
           .first<{ uid: string; username: string; posts: number | null; reg_date: string | null }>();
         if (!member) return json({ error: 'not_found' }, setCookie);
         const agg = await env.DB.prepare(
-          `SELECT AVG(score_halfsteps) AS avg_hs, COUNT(*) AS cnt FROM ratings WHERE target_uid = ?1`,
+          `SELECT AVG(score_bp) AS avg_bp, COUNT(*) AS cnt FROM ratings WHERE target_uid = ?1`,
         )
           .bind(uid)
-          .first<{ avg_hs: number | null; cnt: number }>();
+          .first<{ avg_bp: number | null; cnt: number }>();
         const mine = await env.DB.prepare(
-          `SELECT score_halfsteps AS hs, mode, template_version_id, comment FROM ratings WHERE rater_meta_id = ?1 AND target_uid = ?2`,
+          `SELECT id, score_bp, mode, template_version_id, comment FROM ratings WHERE rater_meta_id = ?1 AND target_uid = ?2`,
         )
           .bind(meta, uid)
-          .first<{ hs: number; mode: string; template_version_id: string | null; comment: string | null }>();
+          .first<{ id: string; score_bp: number; mode: string; template_version_id: string | null; comment: string | null }>();
         // Sampled reviews shown on the profile. Q6 (sampling policy) is open — v1 uses recency.
         const reviews = await env.DB.prepare(
-          `SELECT comment, score_halfsteps AS hs FROM ratings
+          `SELECT comment, score_bp FROM ratings
              WHERE target_uid = ?1 AND comment IS NOT NULL AND comment != ''
              ORDER BY updated_at DESC LIMIT 5`,
         )
           .bind(uid)
-          .all<{ comment: string; hs: number }>();
-        let yourCriteria: { criterion_id: string; halfsteps: number; weight: number }[] = [];
-        if (mine?.mode === 'rich') {
+          .all<{ comment: string; score_bp: number }>();
+        // This browser's rich breakdown + the AUTHORITATIVE evaluation trace (re-evaluated server-side
+        // from the stored raw values against the exact version) for "Visa beräkningen".
+        let yourValues: { criterion_id: string; raw: unknown; normalized_bp: number; weight_milli: number }[] = [];
+        let yourEvaluation: {
+          score_bp: number;
+          base_bp: number;
+          aggregator: string;
+          lines: unknown[];
+          modifiers: unknown[];
+        } | null = null;
+        if (mine?.mode === 'rich' && mine.template_version_id) {
           const rc = await env.DB.prepare(
-            `SELECT criterion_id, score_halfsteps AS halfsteps, weight
-               FROM rating_criteria WHERE rater_meta_id = ?1 AND target_uid = ?2`,
+            `SELECT criterion_id, raw_value_json, normalized_score_bp, weight_milli
+               FROM rating_criterion_value WHERE rating_id = ?1`,
           )
-            .bind(meta, uid)
-            .all<{ criterion_id: string; halfsteps: number; weight: number }>();
-          yourCriteria = rc.results;
+            .bind(mine.id)
+            .all<{ criterion_id: string; raw_value_json: string; normalized_score_bp: number; weight_milli: number }>();
+          yourValues = rc.results.map((v) => ({
+            criterion_id: v.criterion_id,
+            raw: parseJson(v.raw_value_json, {}),
+            normalized_bp: v.normalized_score_bp,
+            weight_milli: v.weight_milli,
+          }));
+          const version = await loadVersion(env, mine.template_version_id);
+          if (version) {
+            const bySlot = new Map(version.criteria.map((c) => [c.id, c]));
+            const evalInputs: EvalInput[] = rc.results
+              .map((v) => {
+                const slot = bySlot.get(v.criterion_id);
+                return slot
+                  ? {
+                      criterion_id: slot.id,
+                      label: slot.label,
+                      type: slot.type,
+                      scoring_config: slot.scoring_config,
+                      raw: parseJson(v.raw_value_json, {}),
+                      weight_milli: v.weight_milli,
+                    }
+                  : null;
+              })
+              .filter((x): x is EvalInput => x !== null);
+            const ev = evaluate(version.calculation_config, evalInputs);
+            yourEvaluation = { score_bp: ev.score_bp, base_bp: ev.base_bp, aggregator: ev.aggregator, lines: ev.lines, modifiers: ev.modifiers };
+          }
         }
         // Reputation R = min(5, B + 0.1·P): community rating B plus a small activity bump. Activity
         // is a SEPARATE component (not quality) and only applies when there's a community rating.
-        const community = toStars(agg?.avg_hs ?? null); // B, or null when unrated
+        const community = agg?.avg_bp == null ? null : r1(bpToStars(agg.avg_bp)); // B, or null when unrated
         const p = postsPerDay(member.posts, member.reg_date);
         const activityBonus = p == null ? 0 : r1(ACTIVITY_WEIGHT * p);
         const reputation =
@@ -495,27 +651,34 @@ export default {
             posts: member.posts,
             regDate: member.reg_date,
             count: agg?.cnt ?? 0,
-            yourHalfsteps: mine?.hs ?? null,
+            yourScoreBp: mine?.score_bp ?? null,
+            yourStars: mine?.score_bp == null ? null : r1(bpToStars(mine.score_bp)),
             yourMode: mine?.mode ?? null,
             yourTemplateVersion: mine?.template_version_id ?? null,
             yourComment: mine?.comment ?? null,
-            yourCriteria,
-            reviews: reviews.results.map((r) => ({ text: r.comment, stars: toStars(r.hs) })),
+            yourValues,
+            yourEvaluation,
+            reviews: reviews.results.map((r) => ({ text: r.comment, stars: r1(bpToStars(r.score_bp)) })),
           },
           setCookie,
         );
       }
 
       // --- Rate: upsert this browser's rating for a member. Re-rating updates, never stacks.
-      // Two modes: 'direct' ({halfsteps}) or 'rich'
-      // ({template_version_id, criteria:[{criterion_id, halfsteps, weight}]}), where the stored
-      // overall score is the weighted mean of the criteria. Ratings bind to the template VERSION.
+      // Two modes: 'direct' ({stars 0..5} or legacy {halfsteps 0..10}) or 'rich'
+      // ({template_version_id, values:[{criterion_id, raw, weight_milli?}]}). In rich mode the server
+      // NORMALIZES each raw value + EVALUATES the version's calculation pipeline (authoritative score);
+      // the result is stored in basis points (score_bp) and the per-criterion raw + normalized values
+      // are kept, so the rating is reproducible forever against the exact version.
       if (path === '/api/rate' && request.method === 'POST') {
         const body = (await request.json().catch(() => ({}))) as {
           uid?: string;
           mode?: string;
+          stars?: number;
           halfsteps?: number;
           template_version_id?: string;
+          values?: { criterion_id: string; raw: unknown; weight_milli?: number }[];
+          // legacy shape (pre-F front): {criteria:[{criterion_id, halfsteps, weight}]}
           criteria?: { criterion_id: string; halfsteps: number; weight: number }[];
           comment?: string;
         };
@@ -529,96 +692,114 @@ export default {
         if (!member) return json({ error: 'not_found' }, setCookie);
 
         const now = new Date().toISOString();
-        let finalHs: number;
+        const ratingId = `${meta}:${uid}`;
+        let scoreBp: number;
         let mode: 'direct' | 'rich';
         let templateVersionId: string | null = null;
-        let rows: { criterion_id: string; halfsteps: number; weight: number }[] = [];
+        let valueRows: {
+          criterion_id: string;
+          raw_value_json: string;
+          normalized_score_bp: number;
+          weight_milli: number;
+        }[] = [];
+        let trace: ReturnType<typeof evaluate> | null = null;
 
         if (body.mode === 'rich') {
           mode = 'rich';
           templateVersionId = (body.template_version_id ?? '').trim();
-          const input = Array.isArray(body.criteria) ? body.criteria : [];
-          if (!templateVersionId || input.length < 1 || input.length > MAX_ACTIVE_CRITERIA) {
+          const version = templateVersionId ? await loadVersion(env, templateVersionId) : null;
+          if (!version) return json({ error: 'bad_request', why: 'unknown version' }, setCookie);
+          const bySlot = new Map(version.criteria.map((c) => [c.id, c]));
+          // Accept the V3 {values} shape, or map the legacy {criteria:[{halfsteps,weight}]} shape.
+          const input =
+            Array.isArray(body.values) && body.values.length
+              ? body.values
+              : (body.criteria ?? []).map((c) => ({
+                  criterion_id: c.criterion_id,
+                  raw: { value: Number(c.halfsteps) / 2 }, // legacy halfsteps (0..10) → 0..5 scale value
+                  weight_milli: Math.round(Number(c.weight) * 1000),
+                }));
+          if (input.length < 1 || input.length > MAX_ACTIVE_CRITERIA) {
             return json({ error: 'bad_request' }, setCookie);
           }
-          // Only accept criteria that actually belong to this template VERSION (no injected ids).
-          const valid = await env.DB.prepare(
-            `SELECT criterion_id AS id FROM template_criterion WHERE template_version_id = ?1`,
-          )
-            .bind(templateVersionId)
-            .all<{ id: string }>();
-          if (valid.results.length === 0) return json({ error: 'bad_request' }, setCookie); // unknown version
-          const allowed = new Set(valid.results.map((c) => c.id));
           const seen = new Set<string>();
-          let wsum = 0;
-          let acc = 0;
-          for (const c of input) {
-            const cid = String(c.criterion_id);
-            const hs = Number(c.halfsteps);
-            const w = Number(c.weight);
-            // Weight is a non-negative real (V2 model). Reject NaN/negatives; 0 is allowed.
-            if (
-              !allowed.has(cid) ||
-              seen.has(cid) ||
-              !Number.isInteger(hs) ||
-              hs < 0 ||
-              hs > 10 ||
-              !Number.isFinite(w) ||
-              w < 0
-            ) {
-              return json({ error: 'bad_request' }, setCookie);
-            }
-            seen.add(cid);
-            wsum += w;
-            acc += hs * w;
-            rows.push({ criterion_id: cid, halfsteps: hs, weight: w });
+          const evalInputs: EvalInput[] = [];
+          for (const v of input) {
+            const slot = bySlot.get(String(v.criterion_id));
+            if (!slot || seen.has(slot.id)) return json({ error: 'bad_request' }, setCookie); // lineage
+            seen.add(slot.id);
+            const wm = v.weight_milli != null ? Number(v.weight_milli) : slot.default_weight_milli;
+            if (!Number.isFinite(wm) || wm < 0) return json({ error: 'bad_request' }, setCookie);
+            evalInputs.push({
+              criterion_id: slot.id,
+              label: slot.label,
+              type: slot.type,
+              scoring_config: slot.scoring_config,
+              raw: v.raw ?? {},
+              weight_milli: Math.round(wm),
+            });
           }
-          if (wsum <= 0) return json({ error: 'bad_request' }, setCookie); // avoid divide-by-zero
-          finalHs = Math.round(acc / wsum); // weighted mean of the criteria, 0..10
+          if (evalInputs.reduce((s, i) => s + i.weight_milli, 0) <= 0) {
+            return json({ error: 'bad_request' }, setCookie);
+          }
+          trace = evaluate(version.calculation_config, evalInputs);
+          scoreBp = trace.score_bp;
+          valueRows = evalInputs.map((i, idx) => ({
+            criterion_id: i.criterion_id,
+            raw_value_json: JSON.stringify(i.raw),
+            normalized_score_bp: trace!.lines[idx].normalized_bp,
+            weight_milli: i.weight_milli,
+          }));
         } else {
           mode = 'direct';
-          const hs = Number(body.halfsteps);
-          if (!Number.isInteger(hs) || hs < 0 || hs > 10) {
-            return json({ error: 'bad_request' }, setCookie);
+          if (body.stars != null) {
+            const s = Number(body.stars);
+            if (!Number.isFinite(s) || s < 0 || s > 5) return json({ error: 'bad_request' }, setCookie);
+            scoreBp = Math.round(s * (BP_MAX / 5)); // 4.5 → 9000
+          } else {
+            const hs = Number(body.halfsteps);
+            if (!Number.isInteger(hs) || hs < 0 || hs > 10) return json({ error: 'bad_request' }, setCookie);
+            scoreBp = hs * 1000;
           }
-          finalHs = hs;
         }
 
-        // Write the overall rating and its per-criterion breakdown as ONE atomic unit, so the
-        // stored score can never desync from its breakdown on a mid-way failure (D1 batch = one
-        // transaction). Order: upsert rating → clear old breakdown → insert new breakdown rows.
+        // Atomic: upsert the rating + replace its criterion values (D1 batch = one transaction), so the
+        // stored score never desyncs from its breakdown. score_bp is canonical; score_halfsteps is kept
+        // in sync (rounded) only for the legacy column.
+        const halfsteps = Math.round(scoreBp / 1000);
         const writes: D1PreparedStatement[] = [
           env.DB.prepare(
-            `INSERT INTO ratings (rater_meta_id, target_uid, score_halfsteps, updated_at, mode, template_version_id, comment)
-               VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+            `INSERT INTO ratings (rater_meta_id, target_uid, id, score_halfsteps, score_bp, updated_at, mode, template_version_id, comment)
+               VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
              ON CONFLICT (rater_meta_id, target_uid) DO UPDATE SET
-               score_halfsteps = excluded.score_halfsteps, updated_at = excluded.updated_at,
-               mode = excluded.mode, template_version_id = excluded.template_version_id, comment = excluded.comment`,
-          ).bind(meta, uid, finalHs, now, mode, templateVersionId, comment),
-          env.DB.prepare(
-            `DELETE FROM rating_criteria WHERE rater_meta_id = ?1 AND target_uid = ?2`,
-          ).bind(meta, uid),
-          ...rows.map((r) =>
+               score_halfsteps = excluded.score_halfsteps, score_bp = excluded.score_bp,
+               updated_at = excluded.updated_at, mode = excluded.mode,
+               template_version_id = excluded.template_version_id, comment = excluded.comment`,
+          ).bind(meta, uid, ratingId, halfsteps, scoreBp, now, mode, templateVersionId, comment),
+          env.DB.prepare(`DELETE FROM rating_criterion_value WHERE rating_id = ?1`).bind(ratingId),
+          ...valueRows.map((r) =>
             env.DB.prepare(
-              `INSERT INTO rating_criteria (rater_meta_id, target_uid, criterion_id, score_halfsteps, weight)
+              `INSERT INTO rating_criterion_value (rating_id, criterion_id, raw_value_json, normalized_score_bp, weight_milli)
                  VALUES (?1, ?2, ?3, ?4, ?5)`,
-            ).bind(meta, uid, r.criterion_id, r.halfsteps, r.weight),
+            ).bind(ratingId, r.criterion_id, r.raw_value_json, r.normalized_score_bp, r.weight_milli),
           ),
         ];
         await env.DB.batch(writes);
 
         const agg = await env.DB.prepare(
-          `SELECT AVG(score_halfsteps) AS avg_hs, COUNT(*) AS cnt FROM ratings WHERE target_uid = ?1`,
+          `SELECT AVG(score_bp) AS avg_bp, COUNT(*) AS cnt FROM ratings WHERE target_uid = ?1`,
         )
           .bind(uid)
-          .first<{ avg_hs: number | null; cnt: number }>();
+          .first<{ avg_bp: number | null; cnt: number }>();
         return json(
           {
             ok: true,
-            stars: toStars(agg?.avg_hs ?? null),
+            score_bp: scoreBp,
+            stars: r1(bpToStars(scoreBp)),
+            community_stars: agg?.avg_bp == null ? null : r1(bpToStars(agg.avg_bp)),
             count: agg?.cnt ?? 0,
-            yourHalfsteps: finalHs,
             yourMode: mode,
+            trace: trace ? { base_bp: trace.base_bp, aggregator: trace.aggregator, lines: trace.lines, modifiers: trace.modifiers } : null,
           },
           setCookie,
         );

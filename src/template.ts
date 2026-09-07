@@ -55,3 +55,84 @@ export function validateCriteria(criteria: VersionCriterion[]): string | null {
   }
   return null;
 }
+
+// ---- V3 dual hashing (batch D). Neither hash is used to destructively dedup published history —
+// snapshot_hash = exact-duplicate detection; logic_hash = "same scoring model, different presentation".
+// Flood control is quotas + discovery behaviour, not deletion of genealogy.
+
+// Deterministic JSON: sort object keys recursively so key-insertion-order never perturbs a hash.
+function stableStringify(v: unknown): string {
+  if (v === null || typeof v !== 'object') return JSON.stringify(v);
+  if (Array.isArray(v)) return '[' + v.map(stableStringify).join(',') + ']';
+  const keys = Object.keys(v as Record<string, unknown>).sort();
+  return '{' + keys.map((k) => JSON.stringify(k) + ':' + stableStringify((v as Record<string, unknown>)[k])).join(',') + '}';
+}
+
+async function sha256hex(s: string): Promise<string> {
+  const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(s));
+  return [...new Uint8Array(digest)].map((b) => b.toString(16).padStart(2, '0')).join('');
+}
+
+export interface SlotForHash {
+  criterion_id: string;
+  label: string;
+  description?: string | null;
+  type: string;
+  position: number;
+  default_active: boolean;
+  default_weight_milli: number;
+  scoring_config: unknown;
+  presentation_config?: unknown;
+}
+export interface VersionForHash {
+  name: string;
+  description?: string | null;
+  calculation_config: unknown;
+  presentation_config?: unknown;
+  criteria: SlotForHash[];
+}
+
+const orderSlots = (cs: SlotForHash[]): SlotForHash[] =>
+  [...cs].sort((a, b) => a.position - b.position || a.criterion_id.localeCompare(b.criterion_id));
+
+// snapshot_hash: ALL versioned published state (name, description, order, labels, descriptions,
+// config/types, weights, calculation config, presentation config).
+export async function snapshotHash(v: VersionForHash): Promise<string> {
+  return sha256hex(
+    stableStringify({
+      name: v.name,
+      description: v.description ?? '',
+      calculation_config: v.calculation_config,
+      presentation_config: v.presentation_config ?? {},
+      criteria: orderSlots(v.criteria).map((c) => ({
+        criterion_id: c.criterion_id,
+        label: c.label,
+        description: c.description ?? '',
+        type: c.type,
+        position: c.position,
+        default_active: c.default_active,
+        default_weight_milli: c.default_weight_milli,
+        scoring_config: c.scoring_config,
+        presentation_config: c.presentation_config ?? {},
+      })),
+    }),
+  );
+}
+
+// logic_hash: score semantics ONLY (scoring config, weights, calculation logic) — excludes cosmetic
+// label/description/presentation differences. Same model + different presentation → same logic_hash.
+export async function logicHash(v: VersionForHash): Promise<string> {
+  return sha256hex(
+    stableStringify({
+      calculation_config: v.calculation_config,
+      criteria: orderSlots(v.criteria).map((c) => ({
+        criterion_id: c.criterion_id,
+        type: c.type,
+        position: c.position,
+        default_active: c.default_active,
+        default_weight_milli: c.default_weight_milli,
+        scoring_config: c.scoring_config,
+      })),
+    }),
+  );
+}
