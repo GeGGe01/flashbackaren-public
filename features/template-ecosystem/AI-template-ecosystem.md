@@ -36,7 +36,16 @@ Support:
 - Criterion identity can survive a label rename.
 - Duplicate or near-identical submissions do not require unbounded storage growth.
 
-## V2 domain model — FROZEN (2026-09-06, per Dexter review)
+## V2 exploratory implementation — SUPERSEDED by the V3 product contract (2026-09-07)
+
+> **This V2 model was an exploratory implementation and is no longer authoritative.** The
+> load-bearing spec is now [`AI-template-ecosystem-v3.md`](./AI-template-ecosystem-v3.md). V3 hardens
+> the domain (immutable versions, revision≠fork, criterion types, generic values, score_bp precision,
+> arbitrary weights, server-authoritative calculation, dual snapshot/logic hashing, tiers on the
+> work, no destructive dedup of published genealogy). The text below is retained only as the record
+> of what V2 shipped (migration 0007); V3 evolves it forward via 0008. Do not treat it as final.
+
+### (historical) V2 domain model — was "FROZEN" 2026-09-06, per Dexter review
 
 Do NOT ALTER the v1 tables incrementally into an ecosystem. Freeze the model first and build it as
 ONE migration (0007). The load-bearing rule: **template identity ≠ template version.** A template is
