@@ -5,6 +5,11 @@ import {
   evaluate,
   bpToStars,
   weightToMilli,
+  validateScoringConfig,
+  validateRawValue,
+  validateCalculationConfig,
+  validateWeightMilli,
+  MAX_WEIGHT_MILLI,
   BP_MAX,
   type EvalInput,
   type CalculationConfig,
@@ -153,5 +158,111 @@ describe('zero vs not-rated (acceptance #22)', () => {
       { criterion_id: 'b', label: 'B', type: 'scale', scoring_config: scale05, raw: { value: 5 }, weight_milli: 1000 },
     ]);
     expect(ev.score_bp).toBe(5000); // (0 + 10000)/2 — the zero counted
+  });
+});
+
+// ---- A–E.1 hardening: strict validation, weight=0 exclusion, config validation, bounds ----
+
+describe('validateScoringConfig (P0-6)', () => {
+  it('scale: rejects max<=min and step<=0; accepts canonical', () => {
+    expect(validateScoringConfig('scale', { min: 5, max: 5 }).ok).toBe(false);
+    expect(validateScoringConfig('scale', { min: 0, max: 5, step: 0 }).ok).toBe(false);
+    const r = validateScoringConfig('scale', { min: 0, max: 5, step: 0.5, junk: 'x' });
+    expect(r.ok).toBe(true);
+    if (r.ok) expect(r.value).toEqual({ min: 0, max: 5, step: 0.5 }); // junk stripped
+  });
+  it('ordinal: rejects empty / duplicate label / >20 / bad score_bp', () => {
+    expect(validateScoringConfig('ordinal', { options: [] }).ok).toBe(false);
+    expect(validateScoringConfig('ordinal', { options: [{ label: 'A', score_bp: 0 }, { label: 'A', score_bp: 1 }] }).ok).toBe(false);
+    expect(validateScoringConfig('ordinal', { options: [{ label: 'A', score_bp: 99999 }] }).ok).toBe(false);
+    expect(validateScoringConfig('ordinal', { options: Array.from({ length: 21 }, (_, i) => ({ label: 'o' + i, score_bp: 0 })) }).ok).toBe(false);
+    expect(validateScoringConfig('ordinal', { options: [{ label: 'A', score_bp: 0 }, { label: 'B', score_bp: 10000 }] }).ok).toBe(true);
+  });
+  it('boolean: true_bp/false_bp must be 0..10000', () => {
+    expect(validateScoringConfig('boolean', { true_bp: 20000 }).ok).toBe(false);
+    expect(validateScoringConfig('boolean', { true_bp: 8000, false_bp: 2000 }).ok).toBe(true);
+  });
+});
+
+describe('validateRawValue — reject, never coerce to 0 (P0-1)', () => {
+  const scale = { min: 0, max: 5, step: 0.5 };
+  it('scale: value 9 on 0..5 REJECTED (not clamped to 5)', () => {
+    expect(validateRawValue('scale', scale, { value: 9 }).ok).toBe(false);
+  });
+  it('scale: off-grid value rejected', () => {
+    expect(validateRawValue('scale', scale, { value: 4.3 }).ok).toBe(false);
+    expect(validateRawValue('scale', scale, { value: 4.5 }).ok).toBe(true);
+  });
+  it('percentage: -5 and 150 REJECTED (not 0)', () => {
+    expect(validateRawValue('percentage', {}, { value: -5 }).ok).toBe(false);
+    expect(validateRawValue('percentage', {}, { value: 150 }).ok).toBe(false);
+    const r = validateRawValue('percentage', {}, { value: 73 });
+    expect(r.ok && r.value.normalized_bp).toBe(7300);
+  });
+  it('boolean: garbage REJECTED (not false)', () => {
+    expect(validateRawValue('boolean', {}, { value: 'yeah' }).ok).toBe(false);
+    expect(validateRawValue('boolean', {}, { value: 7 }).ok).toBe(false);
+    expect(validateRawValue('boolean', {}, { value: true }).ok).toBe(true);
+  });
+  it('ordinal: unknown label/index REJECTED (not 0)', () => {
+    const cfg = { options: [{ label: 'Bra', score_bp: 8000 }] };
+    expect(validateRawValue('ordinal', cfg, { value: 'Usel' }).ok).toBe(false);
+    expect(validateRawValue('ordinal', cfg, { index: 5 }).ok).toBe(false);
+    const r = validateRawValue('ordinal', cfg, { value: 'Bra' });
+    expect(r.ok && r.value.canonical_raw).toEqual({ value: 'Bra' });
+  });
+  it('canonicalizes raw (strips extra fields)', () => {
+    const r = validateRawValue('scale', scale, { value: 4.5, evil: 'x'.repeat(100000) });
+    expect(r.ok && r.value.canonical_raw).toEqual({ value: 4.5 });
+  });
+});
+
+describe('weight=0 descriptive criteria excluded from ALL aggregators (P0-2)', () => {
+  const scale = { min: 0, max: 5 };
+  const mk = (agg: any): CalculationConfig => ({ kind: 'native', aggregator: agg });
+  const inputs: EvalInput[] = [
+    { criterion_id: 'a', label: 'A', type: 'scale', scoring_config: scale, raw: { value: 5 }, weight_milli: 1000 },
+    { criterion_id: 'desc', label: 'Kommentar', type: 'scale', scoring_config: scale, raw: { value: 0 }, weight_milli: 0 },
+  ];
+  it.each(['weighted_mean', 'mean', 'median', 'minimum', 'maximum'])('%s ignores the zero-weight criterion', (agg) => {
+    const ev = evaluate(mk(agg), inputs);
+    expect(ev.score_bp).toBe(10000); // only A (5★) scored; the 0★ weight-0 line excluded
+    expect(ev.scoring_count).toBe(1);
+    const descLine = ev.lines.find((l) => l.criterion_id === 'desc')!;
+    expect(descLine.included_in_score).toBe(false); // still visible in trace
+  });
+  it('all-zero weights → error, not a real 0 score', () => {
+    const ev = evaluate(mk('mean'), [{ ...inputs[1] }]);
+    expect(ev.error).toBeTruthy();
+    expect(ev.scoring_count).toBe(0);
+  });
+});
+
+describe('validateCalculationConfig (P0-5)', () => {
+  const ids = new Set(['a', 'b']);
+  it('rejects unknown aggregator', () => {
+    expect(validateCalculationConfig({ kind: 'native', aggregator: 'sum' }, ids).ok).toBe(false);
+  });
+  it('expression fails closed', () => {
+    expect(validateCalculationConfig({ kind: 'expression', expression: 'a+b' }, ids).ok).toBe(false);
+    const ev = evaluate({ kind: 'expression', expression: 'a+b' } as CalculationConfig, []);
+    expect(ev.error).toBeTruthy();
+  });
+  it('cap/veto referencing a foreign criterion_id rejected', () => {
+    expect(validateCalculationConfig({ kind: 'native', modifiers: [{ kind: 'cap', criterion_id: 'zzz', below_bp: 3000, cap_bp: 4000 }] }, ids).ok).toBe(false);
+    expect(validateCalculationConfig({ kind: 'native', modifiers: [{ kind: 'veto', criterion_id: 'a', below_bp: 3000 }] }, ids).ok).toBe(true);
+  });
+  it('rejects unknown modifier kind', () => {
+    expect(validateCalculationConfig({ kind: 'native', modifiers: [{ kind: 'boost' }] }, ids).ok).toBe(false);
+  });
+});
+
+describe('validateWeightMilli bounds (P0-7)', () => {
+  it('accepts 0..MAX, rejects negative/over/non-integer', () => {
+    expect(validateWeightMilli(0).ok).toBe(true);
+    expect(validateWeightMilli(MAX_WEIGHT_MILLI).ok).toBe(true);
+    expect(validateWeightMilli(MAX_WEIGHT_MILLI + 1).ok).toBe(false);
+    expect(validateWeightMilli(-1).ok).toBe(false);
+    expect(validateWeightMilli(2.5).ok).toBe(false);
   });
 });

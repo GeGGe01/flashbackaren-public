@@ -45,12 +45,18 @@ ALTER TABLE template_criterion ADD COLUMN scoring_config TEXT;      -- JSON per 
 ALTER TABLE template_criterion ADD COLUMN presentation_config TEXT; -- JSON
 
 -- 4. Backfill the Standard version's V3 fields + the work's tier/author/current version.
+-- The snapshot_hash/logic_hash literals below are precomputed with the SAME implementation as
+-- src/template.ts (snapshotHash/logicHash over loadVersion()'s shape of this exact seed) so the
+-- migrated Standard version carries valid dual hashes like every published version (P0-8). A unit
+-- test (src/template.test.ts) asserts the code reproduces these exact values, catching any drift.
 UPDATE template_version SET
   name = (SELECT name FROM template WHERE template.id = template_version.template_id),
   description = 'Standardmall: kunskap, humor, hjälpsamhet, kvalitet.',
   calculation_config = '{"kind":"native","aggregator":"weighted_mean","modifiers":[]}',
   presentation_config = '{"result":"stars","detail":"bars"}',
-  change_note = 'Initial version.'
+  change_note = 'Initial version.',
+  snapshot_hash = '27eec025e04c9e4d8aa1ee0075397c3cd0cc698de1bc4d7cde9b3ba4833a6830',
+  logic_hash = '63a2f1a9417e5a7168dbbb19d4fccd93fdb3fb67591b20cb01dfbd0f819e5271'
 WHERE id = 'tplv-standard-v1';
 
 UPDATE template SET tier = 'standard', status = 'active',

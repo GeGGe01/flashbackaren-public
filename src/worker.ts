@@ -18,10 +18,16 @@ import {
   evaluate,
   bpToStars,
   BP_MAX,
+  validateScoringConfig,
+  validateRawValue,
+  validateCalculationConfig,
+  validateWeightMilli,
+  sanitizePresentationConfig,
   type CriterionType,
   type ScoringConfig,
   type CalculationConfig,
   type EvalInput,
+  type Valid,
 } from './scoring';
 
 // Minimal local shapes so the worker needs no @cloudflare/workers-types dependency.
@@ -125,8 +131,9 @@ function readMeta(request: Request): string | null {
   return m ? decodeURIComponent(m[1]) : null;
 }
 
-function json(body: unknown, extraHeaders?: Record<string, string>): Response {
+function json(body: unknown, extraHeaders?: Record<string, string>, status = 200): Response {
   return new Response(JSON.stringify(body), {
+    status,
     headers: { 'Content-Type': 'application/json', ...(extraHeaders ?? {}) },
   });
 }
@@ -241,25 +248,35 @@ interface LoadedVersion {
   name: string;
   description: string | null;
   tier: Tier;
+  template_status: string;
+  author_identity_id: string;
+  version_no: number;
+  parent_version_id: string | null;
+  published_at: string;
+  snapshot_hash: string | null;
+  logic_hash: string | null;
   calculation_config: CalculationConfig;
   presentation_config: Record<string, unknown>;
   criteria: LoadedCriterion[];
 }
 
+const VERSION_COLS = `tv.id AS version_id, tv.template_id, tv.name, tv.description, tv.version_no,
+  tv.parent_version_id, tv.published_at, tv.snapshot_hash, tv.logic_hash,
+  tv.calculation_config, tv.presentation_config, t.tier, t.status AS template_status,
+  t.author_identity_id`;
+
 // Load a template VERSION (default = the current Standard version) with its typed criteria + configs.
+// Archived/hidden versions still LOAD (historical reads must stay reproducible) — callers that WRITE
+// new ratings enforce template_status === 'active' themselves (P0-3).
 async function loadVersion(env: Env, versionId: string | null): Promise<LoadedVersion | null> {
   const row = versionId
     ? await env.DB.prepare(
-        `SELECT tv.id AS version_id, tv.template_id, tv.name, tv.description,
-                tv.calculation_config, tv.presentation_config, t.tier
-           FROM template_version tv JOIN template t ON t.id = tv.template_id WHERE tv.id = ?1`,
+        `SELECT ${VERSION_COLS} FROM template_version tv JOIN template t ON t.id = tv.template_id WHERE tv.id = ?1`,
       )
         .bind(versionId)
         .first<Record<string, string>>()
     : await env.DB.prepare(
-        `SELECT tv.id AS version_id, tv.template_id, tv.name, tv.description,
-                tv.calculation_config, tv.presentation_config, t.tier
-           FROM template t JOIN template_version tv ON tv.id = t.current_version_id
+        `SELECT ${VERSION_COLS} FROM template t JOIN template_version tv ON tv.id = t.current_version_id
           WHERE t.tier = 'standard' AND t.status = 'active'
           ORDER BY tv.published_at DESC LIMIT 1`,
       ).first<Record<string, string>>();
@@ -277,6 +294,13 @@ async function loadVersion(env: Env, versionId: string | null): Promise<LoadedVe
     name: row.name,
     description: row.description ?? null,
     tier: row.tier as Tier,
+    template_status: row.template_status,
+    author_identity_id: row.author_identity_id,
+    version_no: Number(row.version_no),
+    parent_version_id: (row.parent_version_id as string | null) ?? null,
+    published_at: row.published_at,
+    snapshot_hash: (row.snapshot_hash as string | null) ?? null,
+    logic_hash: (row.logic_hash as string | null) ?? null,
     calculation_config: parseJson<CalculationConfig>(row.calculation_config, {
       kind: 'native',
       aggregator: 'weighted_mean',
@@ -333,20 +357,27 @@ function parseSlots(input: SlotInput[], lineageIds: Set<string>): SlotParse {
     seen.add(cid);
     const label = String(c.label ?? '').trim();
     if (!label || label.length > LIMITS.criterionLabel) return { ok: false, why: 'label' };
+    // Strict limit: reject overlong descriptions (never silently slice immutable published data).
+    const description = c.description === undefined || c.description === null ? null : String(c.description);
+    if (description !== null && description.length > LIMITS.criterionDescription) return { ok: false, why: 'criterion description too long' };
     const type = String(c.type ?? 'scale');
     if (!CRITERION_TYPES.includes(type)) return { ok: false, why: 'type' };
-    const wm = Math.round(Number(c.default_weight_milli ?? 1000));
-    if (!Number.isFinite(wm) || wm < 0) return { ok: false, why: 'weight' };
+    const wv = validateWeightMilli(c.default_weight_milli ?? 1000);
+    if (!wv.ok) return { ok: false, why: 'weight' };
+    // Validate + canonicalize the scoring_config for this type (no arbitrary JSON persisted).
+    const scfg = validateScoringConfig(type as CriterionType, c.scoring_config ?? (type === 'scale' || type === 'bipolar' ? { min: 0, max: 5, step: 0.5 } : {}));
+    if (!scfg.ok) return { ok: false, why: `scoring_config: ${scfg.error}` };
     slots.push({
       criterion_id: cid,
       label,
-      description: String(c.description ?? '').slice(0, LIMITS.criterionDescription) || null,
+      description: description || null,
       type,
       position: i + 1,
       default_active: c.default_active !== false,
-      default_weight_milli: wm,
-      scoring_config: c.scoring_config ?? (type === 'scale' ? { min: 0, max: 5, step: 0.5 } : {}),
-      presentation_config: c.presentation_config ?? {},
+      default_weight_milli: wv.value,
+      scoring_config: scfg.value,
+      // Per-criterion presentation config: server default only until F's schema is finalized (P0-6).
+      presentation_config: {},
     });
   }
   return { ok: true, slots, newCriterionIds };
@@ -380,6 +411,34 @@ function slotWrites(env: Env, versionId: string, slots: SlotForHash[], newCriter
       ),
     ),
   ];
+}
+
+// Resolve a version's calculation + presentation config with the contract's inherit semantics
+// (P0-4): explicitly supplied → validate + store; omitted → inherit from `inheritFrom` (fork source /
+// current version) or fall back to defaults for a fresh root. calculation_config is validated against
+// THIS version's criterion ids (P0-5); presentation_config is sanitized to known keys (P0-6).
+const DEFAULT_CALC: CalculationConfig = { kind: 'native', aggregator: 'weighted_mean', modifiers: [] };
+function resolveConfigs(
+  body: { calculation_config?: unknown; presentation_config?: unknown },
+  inheritFrom: { calculation_config: CalculationConfig; presentation_config: Record<string, unknown> } | null,
+  criterionIds: Set<string>,
+): Valid<{ calc: CalculationConfig; pres: { result: string; detail: string } }> {
+  let calc: CalculationConfig;
+  if (body.calculation_config !== undefined) {
+    const v = validateCalculationConfig(body.calculation_config, criterionIds);
+    if (!v.ok) return { ok: false, error: v.error };
+    calc = v.value;
+  } else if (inheritFrom) {
+    // Inherit — but the criterion set may have shifted; re-validate so a dropped criterion referenced
+    // by a modifier is caught rather than silently mis-scoring.
+    const v = validateCalculationConfig(inheritFrom.calculation_config, criterionIds);
+    if (!v.ok) return { ok: false, error: `inherited calculation_config invalid: ${v.error} — supply calculation_config` };
+    calc = v.value;
+  } else {
+    calc = DEFAULT_CALC;
+  }
+  const presSource = body.presentation_config !== undefined ? body.presentation_config : inheritFrom?.presentation_config;
+  return { ok: true, value: { calc, pres: sanitizePresentationConfig(presSource) } };
 }
 
 export default {
@@ -532,6 +591,8 @@ export default {
           name?: string;
           description?: string;
           parent_version_id?: string;
+          calculation_config?: unknown;
+          presentation_config?: unknown;
           criteria?: {
             criterion_id?: string;
             label?: string;
@@ -545,29 +606,35 @@ export default {
           }[];
         };
         const name = (body.name ?? '').trim();
-        if (!name || name.length > LIMITS.name) return json({ error: 'bad_request', why: 'name' }, setCookie);
-        const description = String(body.description ?? '').slice(0, LIMITS.description);
+        if (!name || name.length > LIMITS.name) return json({ error: 'bad_request', why: 'name' }, setCookie, 400);
+        const description = String(body.description ?? '');
+        if (description.length > LIMITS.description) return json({ error: 'bad_request', why: 'description too long' }, setCookie, 400);
         const author = meta; // author from server identity — never the request body (invariant)
         const nowIso = new Date().toISOString();
 
-        // Fork: load the source version so reused criterion ids can be checked against ITS lineage.
+        // Fork: load the source version so reused criterion ids can be checked against ITS lineage,
+        // and its config can be inherited when the body omits it.
         let parentVersionId: string | null = null;
         let rootTemplateId: string | null = null;
         let sourceIds = new Set<string>();
+        let sourceVer: { calculation_config: CalculationConfig; presentation_config: Record<string, unknown> } | null = null;
         if (body.parent_version_id) {
           const parentVer = await loadVersion(env, String(body.parent_version_id).trim());
-          if (!parentVer) return json({ error: 'bad_request', why: 'unknown parent_version_id' }, setCookie);
+          if (!parentVer) return json({ error: 'bad_request', why: 'unknown parent_version_id' }, setCookie, 400);
           parentVersionId = parentVer.version_id;
           const t = await env.DB.prepare(`SELECT root_template_id FROM template WHERE id = ?1`)
             .bind(parentVer.template_id)
             .first<{ root_template_id: string }>();
           rootTemplateId = t?.root_template_id ?? parentVer.template_id;
           sourceIds = new Set(parentVer.criteria.map((c) => c.id));
+          sourceVer = { calculation_config: parentVer.calculation_config, presentation_config: parentVer.presentation_config };
         }
 
         const parsed = parseSlots(body.criteria ?? [], sourceIds);
-        if (!parsed.ok) return json({ error: 'bad_request', why: parsed.why }, setCookie);
+        if (!parsed.ok) return json({ error: 'bad_request', why: parsed.why }, setCookie, 400);
         const { slots, newCriterionIds } = parsed;
+        const cfg = resolveConfigs(body, sourceVer, new Set(slots.map((s) => s.criterion_id)));
+        if (!cfg.ok) return json({ error: 'bad_request', why: cfg.error }, setCookie, 400);
 
         // Flood control (E): per-identity template cap + publish rate limit.
         const owned = await env.DB.prepare(
@@ -576,15 +643,14 @@ export default {
           .bind(author)
           .first<{ n: number }>();
         if ((owned?.n ?? 0) >= LIMITS.templatesPerIdentity) {
-          return json({ error: 'quota', why: 'max templates for this identity' }, setCookie);
+          return json({ error: 'quota', why: 'max templates for this identity' }, setCookie, 400);
         }
         if (await recentPublishesExceeded(env, author)) {
-          return json({ error: 'quota', why: 'max publishes per 24h' }, setCookie);
+          return json({ error: 'quota', why: 'max publishes per 24h' }, setCookie, 400);
         }
 
-        // Default native calculation + stars presentation (custom calc/presentation come later).
-        const calc = { kind: 'native', aggregator: 'weighted_mean', modifiers: [] };
-        const pres = { result: 'stars', detail: 'bars' };
+        const calc = cfg.value.calc;
+        const pres = cfg.value.pres;
         const forHash = { name, description, calculation_config: calc, presentation_config: pres, criteria: slots };
         const snapshot = await snapshotHash(forHash);
         const logic = await logicHash(forHash);
@@ -626,22 +692,34 @@ export default {
         )
           .bind(templateId)
           .first<{ id: string; author_identity_id: string; status: string; current_version_id: string }>();
-        if (!tpl) return json({ error: 'not_found' }, setCookie);
+        if (!tpl) return json({ error: 'not_found' }, setCookie, 404);
         if (tpl.author_identity_id !== meta) return forbidden(setCookie); // owner only
-        if (tpl.status !== 'active') return json({ error: 'bad_request', why: 'template not active' }, setCookie);
+        if (tpl.status !== 'active') return json({ error: 'bad_request', why: 'template not active' }, setCookie, 400);
         const body = (await request.json().catch(() => ({}))) as {
           name?: string;
           description?: string;
           change_note?: string;
+          calculation_config?: unknown;
+          presentation_config?: unknown;
           criteria?: SlotInput[];
         };
         const name = (body.name ?? '').trim();
-        if (!name || name.length > LIMITS.name) return json({ error: 'bad_request', why: 'name' }, setCookie);
-        const description = String(body.description ?? '').slice(0, LIMITS.description);
+        if (!name || name.length > LIMITS.name) return json({ error: 'bad_request', why: 'name' }, setCookie, 400);
+        const description = String(body.description ?? '');
+        if (description.length > LIMITS.description) return json({ error: 'bad_request', why: 'description too long' }, setCookie, 400);
+        const changeNote = String(body.change_note ?? '');
+        if (changeNote.length > LIMITS.description) return json({ error: 'bad_request', why: 'change_note too long' }, setCookie, 400);
         const current = await loadVersion(env, tpl.current_version_id);
         const lineageIds = new Set((current?.criteria ?? []).map((c) => c.id));
         const parsed = parseSlots(body.criteria ?? [], lineageIds);
-        if (!parsed.ok) return json({ error: 'bad_request', why: parsed.why }, setCookie);
+        if (!parsed.ok) return json({ error: 'bad_request', why: parsed.why }, setCookie, 400);
+        // Config: explicit → validate; omitted → inherit the CURRENT version's config (not reset).
+        const cfg = resolveConfigs(
+          body,
+          current ? { calculation_config: current.calculation_config, presentation_config: current.presentation_config } : null,
+          new Set(parsed.slots.map((s) => s.criterion_id)),
+        );
+        if (!cfg.ok) return json({ error: 'bad_request', why: cfg.error }, setCookie, 400);
         // Quotas (E): versions/template + publishes/24h.
         const vcount = await env.DB.prepare(
           `SELECT COUNT(*) AS n FROM template_version WHERE template_id = ?1`,
@@ -649,10 +727,10 @@ export default {
           .bind(templateId)
           .first<{ n: number }>();
         if ((vcount?.n ?? 0) >= LIMITS.versionsPerTemplate) {
-          return json({ error: 'quota', why: 'max versions for this template' }, setCookie);
+          return json({ error: 'quota', why: 'max versions for this template' }, setCookie, 400);
         }
         if (await recentPublishesExceeded(env, meta)) {
-          return json({ error: 'quota', why: 'max publishes per 24h' }, setCookie);
+          return json({ error: 'quota', why: 'max publishes per 24h' }, setCookie, 400);
         }
         const nowIso = new Date().toISOString();
         const nextNo = await env.DB.prepare(
@@ -660,8 +738,8 @@ export default {
         )
           .bind(templateId)
           .first<{ n: number }>();
-        const calc = { kind: 'native', aggregator: 'weighted_mean', modifiers: [] };
-        const pres = { result: 'stars', detail: 'bars' };
+        const calc = cfg.value.calc;
+        const pres = cfg.value.pres;
         const forHash = { name, description, calculation_config: calc, presentation_config: pres, criteria: parsed.slots };
         const snapshot = await snapshotHash(forHash);
         const logic = await logicHash(forHash);
@@ -683,7 +761,7 @@ export default {
             JSON.stringify(pres),
             snapshot,
             logic,
-            String(body.change_note ?? '').slice(0, LIMITS.description) || 'Revision.',
+            changeNote || 'Revision.',
             nowIso,
           ),
           ...slotWrites(env, versionId, parsed.slots, parsed.newCriterionIds, nowIso),
@@ -705,7 +783,7 @@ export default {
         const tpl = await env.DB.prepare(`SELECT author_identity_id FROM template WHERE id = ?1`)
           .bind(templateId)
           .first<{ author_identity_id: string }>();
-        if (!tpl) return json({ error: 'not_found' }, setCookie);
+        if (!tpl) return json({ error: 'not_found' }, setCookie, 404);
         if (tpl.author_identity_id !== meta) return forbidden(setCookie);
         await env.DB.prepare(`UPDATE template SET status = 'archived' WHERE id = ?1`).bind(templateId).run();
         return json({ ok: true, template_id: templateId, status: 'archived' }, setCookie);
@@ -718,12 +796,12 @@ export default {
         const templateId = path.slice('/api/templates/'.length, -'/tier'.length);
         const body = (await request.json().catch(() => ({}))) as { tier?: string };
         const tier = String(body.tier ?? '');
-        if (tier !== 'community' && tier !== 'featured') return json({ error: 'bad_request', why: 'tier' }, setCookie);
+        if (tier !== 'community' && tier !== 'featured') return json({ error: 'bad_request', why: 'tier' }, setCookie, 400);
         const tpl = await env.DB.prepare(`SELECT tier FROM template WHERE id = ?1`)
           .bind(templateId)
           .first<{ tier: string }>();
-        if (!tpl) return json({ error: 'not_found' }, setCookie);
-        if (tpl.tier === 'standard') return json({ error: 'bad_request', why: 'cannot retier standard' }, setCookie);
+        if (!tpl) return json({ error: 'not_found' }, setCookie, 404);
+        if (tpl.tier === 'standard') return json({ error: 'bad_request', why: 'cannot retier standard' }, setCookie, 400);
         await env.DB.prepare(`UPDATE template SET tier = ?1 WHERE id = ?2`).bind(tier, templateId).run();
         return json({ ok: true, template_id: templateId, tier }, setCookie);
       }
@@ -732,7 +810,7 @@ export default {
       if (path.startsWith('/api/template-versions/') && !path.endsWith('/diff') && request.method === 'GET') {
         const versionId = path.slice('/api/template-versions/'.length);
         const ver = await loadVersion(env, versionId);
-        if (!ver) return json({ error: 'not_found' }, setCookie);
+        if (!ver) return json({ error: 'not_found' }, setCookie, 404);
         return json(ver, setCookie);
       }
 
@@ -741,7 +819,7 @@ export default {
       if (path.startsWith('/api/template-versions/') && path.endsWith('/diff') && request.method === 'GET') {
         const versionId = path.slice('/api/template-versions/'.length, -'/diff'.length);
         const ver = await loadVersion(env, versionId);
-        if (!ver) return json({ error: 'not_found' }, setCookie);
+        if (!ver) return json({ error: 'not_found' }, setCookie, 404);
         const parentId = await env.DB.prepare(`SELECT parent_version_id FROM template_version WHERE id = ?1`)
           .bind(versionId)
           .first<{ parent_version_id: string | null }>();
@@ -780,7 +858,7 @@ export default {
         )
           .bind(uid)
           .first<{ uid: string; username: string; posts: number | null; reg_date: string | null }>();
-        if (!member) return json({ error: 'not_found' }, setCookie);
+        if (!member) return json({ error: 'not_found' }, setCookie, 404);
         const agg = await env.DB.prepare(
           `SELECT AVG(score_bp) AS avg_bp, COUNT(*) AS cnt FROM ratings WHERE target_uid = ?1`,
         )
@@ -894,13 +972,13 @@ export default {
           comment?: string;
         };
         const uid = (body.uid ?? '').trim();
-        if (!uid) return json({ error: 'bad_request' }, setCookie);
+        if (!uid) return json({ error: 'bad_request' }, setCookie, 400);
         const comment = cleanComment(body.comment);
         if (comment === false) return json({ error: 'comment_too_long' }, setCookie);
         const member = await env.DB.prepare(`SELECT uid FROM members WHERE uid = ?1`)
           .bind(uid)
           .first();
-        if (!member) return json({ error: 'not_found' }, setCookie);
+        if (!member) return json({ error: 'not_found' }, setCookie, 404);
 
         const now = new Date().toISOString();
         const ratingId = `${meta}:${uid}`;
@@ -919,7 +997,11 @@ export default {
           mode = 'rich';
           templateVersionId = (body.template_version_id ?? '').trim();
           const version = templateVersionId ? await loadVersion(env, templateVersionId) : null;
-          if (!version) return json({ error: 'bad_request', why: 'unknown version' }, setCookie);
+          if (!version) return json({ error: 'bad_request', why: 'unknown version' }, setCookie, 400);
+          // Archived/hidden templates refuse NEW ratings (P0-3); historical reads still render.
+          if (version.template_status !== 'active') {
+            return json({ error: 'template_not_active' }, setCookie, 409);
+          }
           const bySlot = new Map(version.criteria.map((c) => [c.id, c]));
           // Accept the V3 {values} shape, or map the legacy {criteria:[{halfsteps,weight}]} shape.
           const input =
@@ -931,7 +1013,7 @@ export default {
                   weight_milli: Math.round(Number(c.weight) * 1000),
                 }));
           if (input.length < 1 || input.length > MAX_ACTIVE_CRITERIA) {
-            return json({ error: 'bad_request' }, setCookie);
+            return json({ error: 'bad_request' }, setCookie, 400);
           }
           const seen = new Set<string>();
           const evalInputs: EvalInput[] = [];
@@ -939,21 +1021,26 @@ export default {
             const slot = bySlot.get(String(v.criterion_id));
             if (!slot || seen.has(slot.id)) return json({ error: 'bad_request' }, setCookie); // lineage
             seen.add(slot.id);
-            const wm = v.weight_milli != null ? Number(v.weight_milli) : slot.default_weight_milli;
-            if (!Number.isFinite(wm) || wm < 0) return json({ error: 'bad_request' }, setCookie);
+            // Weight bounded (P0-7): provided override or the slot default, integer 0..MAX.
+            const wv = validateWeightMilli(v.weight_milli != null ? v.weight_milli : slot.default_weight_milli);
+            if (!wv.ok) return json({ error: 'bad_request', why: 'weight_milli' }, setCookie, 400);
+            // STRICT raw validation (P0-1): reject malformed input — never coerce to a real 0 score.
+            const rv = validateRawValue(slot.type, slot.scoring_config, v.raw);
+            if (!rv.ok) return json({ error: 'bad_request', why: rv.error }, setCookie, 400);
             evalInputs.push({
               criterion_id: slot.id,
               label: slot.label,
               type: slot.type,
               scoring_config: slot.scoring_config,
-              raw: v.raw ?? {},
-              weight_milli: Math.round(wm),
+              raw: rv.value.canonical_raw, // canonicalized — no arbitrary client JSON persisted (P0-6)
+              weight_milli: wv.value,
             });
           }
-          if (evalInputs.reduce((s, i) => s + i.weight_milli, 0) <= 0) {
-            return json({ error: 'bad_request' }, setCookie);
-          }
           trace = evaluate(version.calculation_config, evalInputs);
+          if (trace.error || trace.scoring_count === 0) {
+            // e.g. all weights zero, or an unsupported (expression) calculation — reject, not 0.
+            return json({ error: 'bad_request', why: trace.error ?? 'no scoring criteria' }, setCookie, 400);
+          }
           scoreBp = trace.score_bp;
           valueRows = evalInputs.map((i, idx) => ({
             criterion_id: i.criterion_id,
@@ -965,11 +1052,11 @@ export default {
           mode = 'direct';
           if (body.stars != null) {
             const s = Number(body.stars);
-            if (!Number.isFinite(s) || s < 0 || s > 5) return json({ error: 'bad_request' }, setCookie);
+            if (!Number.isFinite(s) || s < 0 || s > 5) return json({ error: 'bad_request' }, setCookie, 400);
             scoreBp = Math.round(s * (BP_MAX / 5)); // 4.5 → 9000
           } else {
             const hs = Number(body.halfsteps);
-            if (!Number.isInteger(hs) || hs < 0 || hs > 10) return json({ error: 'bad_request' }, setCookie);
+            if (!Number.isInteger(hs) || hs < 0 || hs > 10) return json({ error: 'bad_request' }, setCookie, 400);
             scoreBp = hs * 1000;
           }
         }

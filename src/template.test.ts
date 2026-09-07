@@ -122,3 +122,25 @@ describe('V3 dual hashing (snapshot vs logic)', () => {
     expect(await snapshotHash(reordered)).toBe(await snapshotHash(base));
   });
 });
+
+describe('P0-8: migration 0008 Standard hashes match the code', () => {
+  // Exactly loadVersion()'s shape of the seeded Standard v1 (as migration 0008 stores it).
+  const stdV1: VersionForHash = {
+    name: 'Standard',
+    description: 'Standardmall: kunskap, humor, hjälpsamhet, kvalitet.',
+    calculation_config: { kind: 'native', aggregator: 'weighted_mean', modifiers: [] },
+    presentation_config: { result: 'stars', detail: 'bars' },
+    criteria: [
+      { criterion_id: 'crit-knowledge', label: 'Kunskap', description: null, type: 'scale', position: 1, default_active: true, default_weight_milli: 1000, scoring_config: { min: 0, max: 5, step: 0.5 }, presentation_config: { kind: 'stars' } },
+      { criterion_id: 'crit-humor', label: 'Humor', description: null, type: 'scale', position: 2, default_active: true, default_weight_milli: 1000, scoring_config: { min: 0, max: 5, step: 0.5 }, presentation_config: { kind: 'stars' } },
+      { criterion_id: 'crit-helpfulness', label: 'Hjälpsamhet', description: null, type: 'scale', position: 3, default_active: true, default_weight_milli: 1000, scoring_config: { min: 0, max: 5, step: 0.5 }, presentation_config: { kind: 'stars' } },
+      { criterion_id: 'crit-quality', label: 'Kvalitet', description: null, type: 'scale', position: 4, default_active: true, default_weight_milli: 1000, scoring_config: { min: 0, max: 5, step: 0.5 }, presentation_config: { kind: 'stars' } },
+    ],
+  };
+  it('snapshot_hash literal in 0008 is reproducible', async () => {
+    expect(await snapshotHash(stdV1)).toBe('27eec025e04c9e4d8aa1ee0075397c3cd0cc698de1bc4d7cde9b3ba4833a6830');
+  });
+  it('logic_hash literal in 0008 is reproducible', async () => {
+    expect(await logicHash(stdV1)).toBe('63a2f1a9417e5a7168dbbb19d4fccd93fdb3fb67591b20cb01dfbd0f819e5271');
+  });
+});
