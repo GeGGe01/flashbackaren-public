@@ -93,6 +93,29 @@ join; backfill `ratings.template_version_id` from that standard version; retire 
 existing criteria+weights model; first-class native calculations/visuals (Q7) are decided before any
 custom formula is allowed to expand.
 
+## V2 — BUILT (2026-09-07)
+
+Shipped as **migration 0007** (one pass, per the frozen model) + `src/template.ts` + worker endpoints
++ front picker/fork. Verified: migration applies clean (local), 25 unit tests green (incl. the
+worker's `canonicalHash` matching the seed hash baked into 0007), and a full local e2e (create →
+fork-verbatim-dedups-to-source → discovery tier-order + stats → rich-rate binds to the version).
+
+- **Schema:** `template` (work) · `template_version` (immutable snapshot, `parent_version_id`,
+  `canonical_hash`, `tier`, `UNIQUE(template_id, version_no)`) · `criterion` (stable id) ·
+  `template_criterion` (per-version join: label/position/`weight_default` REAL≥0). `ratings.template_id`
+  → `ratings.template_version_id`; `rating_criteria.weight` widened to REAL≥0, FK → `criterion`. Old
+  `templates`/`criteria` retired.
+- **Endpoints:** `GET /api/template[?version=]` (a version's criteria for the rating UI) ·
+  `GET /api/templates` (discovery: latest version per work, Standard→Featured→Community, then uses↓
+  forks↓ published_at) · `POST /api/templates` (create/fork → validate → canonicalize → **dedup by
+  hash** or insert; new works are `tier=community`; featured/standard are operator-curated only).
+- **`canonical_hash`** = sha256 of the position-ordered `criterion_id:position:weight` set (label
+  excluded — a pure relabel is the same shape). Same function on both sides (`src/template.ts`), so
+  the migration's precomputed seed hash and a runtime fork of the same shape agree (asserted in tests).
+- **UI:** rich-rating gains a template picker (tier-labelled) and a "Forka" button; ratings post
+  `template_version_id`; a criterion's default weight comes from `weight_default`.
+- **Out of scope (unchanged):** custom calculation formulas; rating history (still current-state-only).
+
 ## Documentation update requirement
 
 After implementing or materially changing this feature, update the relevant PoAG

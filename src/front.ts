@@ -62,6 +62,9 @@ export const FRONT_HTML = /* html */ `<!doctype html>
   .mode { background:#fff; color:var(--muted); border:1px solid var(--frame); border-radius:3px; padding:5px 12px; font-size:13px; font-weight:600; cursor:pointer; }
   .mode.active { background:var(--primary); color:#fff; border-color:#2e6da4; }
   .tpl-name { color:var(--muted); font-size:12px; margin:12px 0 6px; }
+  .tpl-pick-row { display:flex; align-items:center; gap:8px; margin:12px 0 4px; }
+  .tpl-pick-row select { padding:4px 6px; border:1px solid var(--frame); background:#fff; font:13px var(--sans); max-width:22rem; }
+  .tpl-pick-row button.ghost { padding:5px 10px; font-size:12px; }
   .crit { padding:8px 0; border-bottom:1px solid var(--row2); }
   .crit-head { display:flex; justify-content:space-between; font-size:14px; }
   .crit-label { font-weight:600; }
@@ -125,8 +128,16 @@ async function search(q) {
   }
 }
 
-let TEMPLATE = null;
-async function getTemplate(){ if(!TEMPLATE) TEMPLATE = await (await fetch(BASE + '/api/template')).json(); return TEMPLATE; }
+// Templates are keyed by their VERSION id (ratings bind to the version). '__default__' = the current
+// Standard version the server picks when no version is named.
+const TPL_CACHE = {};
+async function getTemplate(versionId){
+  const key = versionId || '__default__';
+  if(!TPL_CACHE[key]) TPL_CACHE[key] = await (await fetch(BASE + '/api/template' + (versionId ? '?version=' + encodeURIComponent(versionId) : ''))).json();
+  return TPL_CACHE[key];
+}
+let TEMPLATES = null;
+async function getTemplates(force){ if(force) TEMPLATES = null; if(!TEMPLATES) TEMPLATES = await (await fetch(BASE + '/api/templates')).json(); return TEMPLATES; }
 function repLine(p){
   if (p.reputation == null) {
     const act = p.postsPerDay == null ? '' : ' · ' + p.postsPerDay + ' inlägg/dag';
@@ -203,13 +214,24 @@ function renderDirect(state){
   };
 }
 
-async function renderRich(state){
-  const tpl = await getTemplate();
+async function renderRich(state, versionId){
+  // Which template version to rate against: an explicit pick, else your last-used version, else the
+  // server's default (Standard). Ratings bind to the VERSION, so the picker drives everything.
+  const vid = versionId || state.p.yourTemplateVersion || null;
+  const tpl = await getTemplate(vid);
+  const templates = await getTemplates();
+  const tierLabel = { standard:'Standard', featured:'Utvald', community:'Community' };
+  const pickHtml = '<div class="tpl-pick-row"><label class="wlab">Mall '+
+    '<select id="tpl-pick">' + templates.map(t =>
+      '<option value="'+t.version_id+'"'+(t.version_id===tpl.id?' selected':'')+'>'+
+        esc(t.name)+' · '+tierLabel[t.tier]+(t.uses?(' · '+t.uses+' röster'):'')+'</option>').join('') +
+    '</select></label> <button id="fork-tpl" class="ghost" title="Skapa en egen kopia du kan ändra">Forka</button></div>';
   // A criterion you previously rated starts ACTIVE; the rest start unrated ("ingår ej"). Unrated is
   // NOT zero — only active criteria enter the weighted mean and get stored.
   const prev = {}; (state.p.yourCriteria||[]).forEach(c => prev[c.criterion_id] = c);
   const rowsHtml = tpl.criteria.map(c => {
-    const pc = prev[c.id]; const on = !!pc; const hs = pc ? pc.halfsteps : 0; const w = pc ? pc.weight : 1;
+    const pc = prev[c.id]; const on = !!pc; const hs = pc ? pc.halfsteps : 0;
+    const w = pc ? pc.weight : ((c.weight_default>=1 && c.weight_default<=5) ? c.weight_default : 1);
     return '<div class="crit'+(on?'':' off')+'" data-cid="'+c.id+'">' +
       '<div class="crit-head"><label class="crit-label"><input type="checkbox" class="c-active"'+(on?' checked':'')+'> '+esc(c.label)+'</label>' +
         '<span class="crit-val">'+(on?(hs/2).toFixed(1)+' ★':'ingår ej')+'</span></div>' +
@@ -218,7 +240,7 @@ async function renderRich(state){
           [1,2,3,4,5].map(x=>'<option'+(x===w?' selected':'')+'>'+x+'</option>').join('') +
         '</select></label></div></div>';
   }).join('');
-  $('#rate-area').innerHTML = '<p class="tpl-name">Mall: '+esc(tpl.name)+' · viktat snitt av aktiva kriterier</p>' + rowsHtml +
+  $('#rate-area').innerHTML = pickHtml + '<p class="tpl-name">viktat snitt av aktiva kriterier</p>' + rowsHtml +
     '<div class="rate-row"><strong>Blir <span id="rich-final">–</span></strong>' +
       '<button id="submit">Betygsätt</button></div>' + commentFieldHtml(state.p.yourComment);
   const activeCrits = () => [...profile.querySelectorAll('.crit')]
@@ -245,11 +267,24 @@ async function renderRich(state){
   profile.querySelectorAll('.c-active, .c-score, .c-weight').forEach(i => { i.oninput = recompute; i.onchange = recompute; });
   recompute();
   wireComment();
+  // Switch which template version you're rating against — re-renders the criteria for that version.
+  $('#tpl-pick').onchange = (e) => renderRich(state, e.target.value);
+  // Fork: make your own editable copy of the current version (verbatim), then switch to it. The
+  // server dedups an identical shape back to the source, so a no-change fork just reselects it.
+  $('#fork-tpl').onclick = async () => {
+    const name = prompt('Namn på din mall-kopia:', tpl.name + ' (min)');
+    if (!name) return;
+    const criteria = tpl.criteria.map((c, i) => ({ criterion_id: c.id, label: c.label, position: i+1,
+      weight_default: (c.weight_default!=null ? c.weight_default : 1) }));
+    const r = await (await fetch(BASE + '/api/templates', { method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({ name: name, author_identity: 'anon', parent_version_id: tpl.id, criteria: criteria }) })).json();
+    if (r.version_id){ await getTemplates(true); renderRich(state, r.version_id); }
+  };
   $('#submit').onclick = async () => {
     const crits = activeCrits();
     if (!crits.length){ $('#note').textContent = 'Aktivera minst ett kriterium.'; return; }
     const d = await (await fetch(BASE + '/api/rate', { method:'POST', headers:{'Content-Type':'application/json'},
-      body: JSON.stringify({ uid: state.uid, mode:'rich', template_id: tpl.id, criteria: crits, comment: getComment() }) })).json();
+      body: JSON.stringify({ uid: state.uid, mode:'rich', template_version_id: tpl.id, criteria: crits, comment: getComment() }) })).json();
     if (d.ok) afterRate(state);
     else if (d.error === 'comment_too_long') $('#note').textContent = 'Omdömet är för långt (max 420 tecken / 88 ord).';
   };
