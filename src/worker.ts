@@ -6,6 +6,14 @@
 // All Flashback bytes cross exactly one boundary — the FlashbackNormalizer — which yields canonical
 // UTF-8 + source metadata. Nothing below decodes upstream bytes itself; parsers assume UTF-8.
 import { fetchFlashback, normalizeBytes } from './flashback';
+import {
+  canonicalHash,
+  validateCriteria,
+  MAX_ACTIVE_CRITERIA,
+  TIER_RANK,
+  type VersionCriterion,
+  type Tier,
+} from './template';
 
 // Minimal local shapes so the worker needs no @cloudflare/workers-types dependency.
 interface D1Result<T = Record<string, unknown>> {
@@ -233,18 +241,203 @@ export default {
         );
       }
 
-      // --- The rating template (its criteria) for the rich rating UI. v1: the one Standard template.
+      // --- The default rating template VERSION (its criteria) for the rich rating UI. The `id`
+      // returned is a template_version id — ratings bind to the version, so this is what /api/rate
+      // expects back as `template_version_id`. v1 default: the Standard template's latest version.
       if (path === '/api/template' && request.method === 'GET') {
-        const tpl = await env.DB.prepare(
-          `SELECT id, name FROM templates WHERE kind = 'standard' ORDER BY created_at LIMIT 1`,
-        ).first<{ id: string; name: string }>();
-        if (!tpl) return json({ error: 'no_template' }, setCookie);
+        const wanted = (url.searchParams.get('version') ?? '').trim();
+        const ver = wanted
+          ? await env.DB.prepare(
+              `SELECT tv.id AS version_id, t.name AS name FROM template_version tv
+                 JOIN template t ON t.id = tv.template_id WHERE tv.id = ?1`,
+            )
+              .bind(wanted)
+              .first<{ version_id: string; name: string }>()
+          : await env.DB.prepare(
+              `SELECT tv.id AS version_id, t.name AS name FROM template_version tv
+                 JOIN template t ON t.id = tv.template_id WHERE tv.tier = 'standard'
+                 ORDER BY tv.published_at DESC, tv.version_no DESC LIMIT 1`,
+            ).first<{ version_id: string; name: string }>();
+        if (!ver) return json({ error: 'no_template' }, setCookie);
         const crit = await env.DB.prepare(
-          `SELECT id, label FROM criteria WHERE template_id = ?1 ORDER BY position`,
+          `SELECT criterion_id AS id, label, weight_default FROM template_criterion
+             WHERE template_version_id = ?1 ORDER BY position`,
         )
-          .bind(tpl.id)
-          .all<{ id: string; label: string }>();
-        return json({ id: tpl.id, name: tpl.name, criteria: crit.results }, setCookie);
+          .bind(ver.version_id)
+          .all<{ id: string; label: string; weight_default: number }>();
+        return json({ id: ver.version_id, name: ver.name, criteria: crit.results }, setCookie);
+      }
+
+      // --- Discovery: all templates (latest version each) with tier + stats, deterministically
+      // ordered Standard → Featured → Community, then uses desc, forks desc, published_at. Community
+      // junk never dominates; standard/featured (operator-curated) float to the top.
+      if (path === '/api/templates' && request.method === 'GET') {
+        const latest = await env.DB.prepare(
+          `SELECT t.id AS template_id, t.name, t.author_identity,
+                  tv.id AS version_id, tv.version_no, tv.tier, tv.published_at,
+                  (SELECT COUNT(*) FROM template_criterion tc WHERE tc.template_version_id = tv.id) AS criteria_count
+             FROM template t
+             JOIN template_version tv ON tv.template_id = t.id
+             JOIN (SELECT template_id, MAX(version_no) AS mx FROM template_version GROUP BY template_id) l
+               ON l.template_id = t.id AND l.mx = tv.version_no`,
+        ).all<{
+          template_id: string;
+          name: string;
+          author_identity: string;
+          version_id: string;
+          version_no: number;
+          tier: Tier;
+          published_at: string;
+          criteria_count: number;
+        }>();
+        // uses = ratings bound to any version of the template; forks = other templates whose v1
+        // was derived from a version of this template.
+        const usesRows = await env.DB.prepare(
+          `SELECT tv.template_id AS tid, COUNT(*) AS uses
+             FROM ratings r JOIN template_version tv ON tv.id = r.template_version_id
+            GROUP BY tv.template_id`,
+        ).all<{ tid: string; uses: number }>();
+        const forkRows = await env.DB.prepare(
+          `SELECT parent.template_id AS tid, COUNT(*) AS forks
+             FROM template_version child JOIN template_version parent ON parent.id = child.parent_version_id
+            WHERE child.version_no = 1 AND child.parent_version_id IS NOT NULL
+            GROUP BY parent.template_id`,
+        ).all<{ tid: string; forks: number }>();
+        const uses = new Map(usesRows.results.map((r) => [r.tid, r.uses]));
+        const forks = new Map(forkRows.results.map((r) => [r.tid, r.forks]));
+        const list = latest.results
+          .map((t) => ({
+            template_id: t.template_id,
+            version_id: t.version_id,
+            name: t.name,
+            author: t.author_identity,
+            tier: t.tier,
+            version_no: t.version_no,
+            criteriaCount: t.criteria_count,
+            uses: uses.get(t.template_id) ?? 0,
+            forks: forks.get(t.template_id) ?? 0,
+            published_at: t.published_at,
+          }))
+          .sort(
+            (a, b) =>
+              (TIER_RANK[a.tier] ?? 9) - (TIER_RANK[b.tier] ?? 9) ||
+              b.uses - a.uses ||
+              b.forks - a.forks ||
+              a.published_at.localeCompare(b.published_at),
+          );
+        return json(list, setCookie);
+      }
+
+      // --- Create or fork a template. Body: { name, author_identity?, criteria:[{criterion_id?,
+      // label, position, weight_default}], parent_version_id? }. A parent_version_id makes it a FORK
+      // (new work whose v1 derives from that exact version); otherwise a fresh root template. New
+      // criteria mint a stable criterion id; forks may reuse existing criterion ids to keep lineage.
+      // Canonicalize → dedup: if a version with the same canonical shape already exists, return it
+      // rather than inserting a duplicate (no unbounded growth). New templates are tier=community
+      // (featured/standard are operator-curated only, never set here).
+      if (path === '/api/templates' && request.method === 'POST') {
+        const body = (await request.json().catch(() => ({}))) as {
+          name?: string;
+          author_identity?: string;
+          parent_version_id?: string;
+          criteria?: { criterion_id?: string; label?: string; position?: number; weight_default?: number }[];
+        };
+        const name = (body.name ?? '').trim();
+        if (!name || name.length > 80) return json({ error: 'bad_request', why: 'name' }, setCookie);
+        const author = (body.author_identity ?? 'anon').trim().slice(0, 80) || 'anon';
+
+        // Resolve/assign criterion ids (mint for brand-new criteria), then validate the set.
+        const input = Array.isArray(body.criteria) ? body.criteria : [];
+        const nowIso = new Date().toISOString();
+        const newCriterionIds: string[] = [];
+        const crits: VersionCriterion[] = input.map((c, i) => {
+          let cid = (c.criterion_id ?? '').trim();
+          if (!cid) {
+            cid = 'crit-' + crypto.randomUUID();
+            newCriterionIds.push(cid);
+          }
+          return {
+            criterion_id: cid,
+            label: String(c.label ?? '').trim(),
+            position: Number.isInteger(c.position) ? (c.position as number) : i + 1,
+            weight_default: Number(c.weight_default ?? 1),
+          };
+        });
+        const bad = validateCriteria(crits);
+        if (bad) return json({ error: 'bad_request', why: bad }, setCookie);
+
+        // Reused criterion ids (on a fork) must actually exist — no injecting arbitrary lineage ids.
+        const reused = crits.map((c) => c.criterion_id).filter((id) => !newCriterionIds.includes(id));
+        if (reused.length) {
+          const found = await env.DB.prepare(
+            `SELECT id FROM criterion WHERE id IN (${reused.map(() => '?').join(',')})`,
+          )
+            .bind(...reused)
+            .all<{ id: string }>();
+          if (found.results.length !== reused.length)
+            return json({ error: 'bad_request', why: 'unknown criterion_id' }, setCookie);
+        }
+
+        // Validate the fork parent exists (if forking) and find its root for genealogy chaining.
+        let parentVersionId: string | null = null;
+        let rootTemplateId: string | null = null;
+        if (body.parent_version_id) {
+          const parent = await env.DB.prepare(
+            `SELECT tv.id AS vid, t.root_template_id AS root FROM template_version tv
+               JOIN template t ON t.id = tv.template_id WHERE tv.id = ?1`,
+          )
+            .bind(body.parent_version_id.trim())
+            .first<{ vid: string; root: string }>();
+          if (!parent) return json({ error: 'bad_request', why: 'unknown parent_version_id' }, setCookie);
+          parentVersionId = parent.vid;
+          rootTemplateId = parent.root;
+        }
+
+        // Canonicalize + dedup at the VERSION level.
+        const hash = await canonicalHash(crits);
+        const dupe = await env.DB.prepare(
+          `SELECT tv.id AS version_id, tv.template_id, t.name FROM template_version tv
+             JOIN template t ON t.id = tv.template_id WHERE tv.canonical_hash = ?1 LIMIT 1`,
+        )
+          .bind(hash)
+          .first<{ version_id: string; template_id: string; name: string }>();
+        if (dupe) {
+          return json(
+            { deduped: true, template_id: dupe.template_id, version_id: dupe.version_id, name: dupe.name },
+            setCookie,
+          );
+        }
+
+        // Insert the new work + its v1 + any new criterion rows + the join, atomically.
+        const templateId = 'tpl-' + crypto.randomUUID();
+        const versionId = 'tplv-' + crypto.randomUUID();
+        const root = rootTemplateId ?? templateId; // a fresh root points at itself
+        const writes: D1PreparedStatement[] = [
+          env.DB.prepare(
+            `INSERT INTO template (id, root_template_id, name, author_identity, created_at)
+               VALUES (?1, ?2, ?3, ?4, ?5)`,
+          ).bind(templateId, root, name, author, nowIso),
+          env.DB.prepare(
+            `INSERT INTO template_version
+               (id, template_id, version_no, parent_version_id, canonical_hash, tier, published_at)
+               VALUES (?1, ?2, 1, ?3, ?4, 'community', ?5)`,
+          ).bind(versionId, templateId, parentVersionId, hash, nowIso),
+          ...newCriterionIds.map((cid) =>
+            env.DB.prepare(`INSERT INTO criterion (id, created_at) VALUES (?1, ?2)`).bind(cid, nowIso),
+          ),
+          ...crits.map((c) =>
+            env.DB.prepare(
+              `INSERT INTO template_criterion
+                 (template_version_id, criterion_id, label, position, weight_default)
+                 VALUES (?1, ?2, ?3, ?4, ?5)`,
+            ).bind(versionId, c.criterion_id, c.label, c.position, c.weight_default),
+          ),
+        ];
+        await env.DB.batch(writes);
+        return json(
+          { deduped: false, template_id: templateId, version_id: versionId, name, tier: 'community' },
+          setCookie,
+        );
       }
 
       // --- See: one member's aggregate + this browser's current rating (with rich breakdown).
@@ -262,10 +455,10 @@ export default {
           .bind(uid)
           .first<{ avg_hs: number | null; cnt: number }>();
         const mine = await env.DB.prepare(
-          `SELECT score_halfsteps AS hs, mode, template_id, comment FROM ratings WHERE rater_meta_id = ?1 AND target_uid = ?2`,
+          `SELECT score_halfsteps AS hs, mode, template_version_id, comment FROM ratings WHERE rater_meta_id = ?1 AND target_uid = ?2`,
         )
           .bind(meta, uid)
-          .first<{ hs: number; mode: string; template_id: string | null; comment: string | null }>();
+          .first<{ hs: number; mode: string; template_version_id: string | null; comment: string | null }>();
         // Sampled reviews shown on the profile. Q6 (sampling policy) is open — v1 uses recency.
         const reviews = await env.DB.prepare(
           `SELECT comment, score_halfsteps AS hs FROM ratings
@@ -304,6 +497,7 @@ export default {
             count: agg?.cnt ?? 0,
             yourHalfsteps: mine?.hs ?? null,
             yourMode: mine?.mode ?? null,
+            yourTemplateVersion: mine?.template_version_id ?? null,
             yourComment: mine?.comment ?? null,
             yourCriteria,
             reviews: reviews.results.map((r) => ({ text: r.comment, stars: toStars(r.hs) })),
@@ -313,14 +507,15 @@ export default {
       }
 
       // --- Rate: upsert this browser's rating for a member. Re-rating updates, never stacks.
-      // Two modes: 'direct' ({halfsteps}) or 'rich' ({template_id, criteria:[{criterion_id, halfsteps, weight}]}),
-      // where the stored overall score is the weighted mean of the criteria.
+      // Two modes: 'direct' ({halfsteps}) or 'rich'
+      // ({template_version_id, criteria:[{criterion_id, halfsteps, weight}]}), where the stored
+      // overall score is the weighted mean of the criteria. Ratings bind to the template VERSION.
       if (path === '/api/rate' && request.method === 'POST') {
         const body = (await request.json().catch(() => ({}))) as {
           uid?: string;
           mode?: string;
           halfsteps?: number;
-          template_id?: string;
+          template_version_id?: string;
           criteria?: { criterion_id: string; halfsteps: number; weight: number }[];
           comment?: string;
         };
@@ -336,20 +531,23 @@ export default {
         const now = new Date().toISOString();
         let finalHs: number;
         let mode: 'direct' | 'rich';
-        let templateId: string | null = null;
+        let templateVersionId: string | null = null;
         let rows: { criterion_id: string; halfsteps: number; weight: number }[] = [];
 
         if (body.mode === 'rich') {
           mode = 'rich';
-          templateId = (body.template_id ?? '').trim();
+          templateVersionId = (body.template_version_id ?? '').trim();
           const input = Array.isArray(body.criteria) ? body.criteria : [];
-          if (!templateId || input.length < 1 || input.length > 10) {
+          if (!templateVersionId || input.length < 1 || input.length > MAX_ACTIVE_CRITERIA) {
             return json({ error: 'bad_request' }, setCookie);
           }
-          // Only accept criteria that actually belong to the template (no injected ids).
-          const valid = await env.DB.prepare(`SELECT id FROM criteria WHERE template_id = ?1`)
-            .bind(templateId)
+          // Only accept criteria that actually belong to this template VERSION (no injected ids).
+          const valid = await env.DB.prepare(
+            `SELECT criterion_id AS id FROM template_criterion WHERE template_version_id = ?1`,
+          )
+            .bind(templateVersionId)
             .all<{ id: string }>();
+          if (valid.results.length === 0) return json({ error: 'bad_request' }, setCookie); // unknown version
           const allowed = new Set(valid.results.map((c) => c.id));
           const seen = new Set<string>();
           let wsum = 0;
@@ -358,15 +556,15 @@ export default {
             const cid = String(c.criterion_id);
             const hs = Number(c.halfsteps);
             const w = Number(c.weight);
+            // Weight is a non-negative real (V2 model). Reject NaN/negatives; 0 is allowed.
             if (
               !allowed.has(cid) ||
               seen.has(cid) ||
               !Number.isInteger(hs) ||
               hs < 0 ||
               hs > 10 ||
-              !Number.isInteger(w) ||
-              w < 1 ||
-              w > 5
+              !Number.isFinite(w) ||
+              w < 0
             ) {
               return json({ error: 'bad_request' }, setCookie);
             }
@@ -375,6 +573,7 @@ export default {
             acc += hs * w;
             rows.push({ criterion_id: cid, halfsteps: hs, weight: w });
           }
+          if (wsum <= 0) return json({ error: 'bad_request' }, setCookie); // avoid divide-by-zero
           finalHs = Math.round(acc / wsum); // weighted mean of the criteria, 0..10
         } else {
           mode = 'direct';
@@ -390,12 +589,12 @@ export default {
         // transaction). Order: upsert rating → clear old breakdown → insert new breakdown rows.
         const writes: D1PreparedStatement[] = [
           env.DB.prepare(
-            `INSERT INTO ratings (rater_meta_id, target_uid, score_halfsteps, updated_at, mode, template_id, comment)
+            `INSERT INTO ratings (rater_meta_id, target_uid, score_halfsteps, updated_at, mode, template_version_id, comment)
                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
              ON CONFLICT (rater_meta_id, target_uid) DO UPDATE SET
                score_halfsteps = excluded.score_halfsteps, updated_at = excluded.updated_at,
-               mode = excluded.mode, template_id = excluded.template_id, comment = excluded.comment`,
-          ).bind(meta, uid, finalHs, now, mode, templateId, comment),
+               mode = excluded.mode, template_version_id = excluded.template_version_id, comment = excluded.comment`,
+          ).bind(meta, uid, finalHs, now, mode, templateVersionId, comment),
           env.DB.prepare(
             `DELETE FROM rating_criteria WHERE rater_meta_id = ?1 AND target_uid = ?2`,
           ).bind(meta, uid),
