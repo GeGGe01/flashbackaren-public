@@ -197,8 +197,23 @@ const LIMITS = {
   description: 280,
   criterionLabel: 48,
   criterionDescription: 160,
+  templatesPerIdentity: 10,
+  publishesPer24h: 3,
+  versionsPerTemplate: 25,
 } as const;
 const CRITERION_TYPES = ['scale', 'boolean', 'ordinal', 'percentage', 'bipolar'];
+
+// Publish rate limit (batch E flood control): count versions this identity published in the last 24h.
+async function recentPublishesExceeded(env: Env, author: string): Promise<boolean> {
+  const cutoff = new Date(Date.now() - 24 * 3600 * 1000).toISOString();
+  const row = await env.DB.prepare(
+    `SELECT COUNT(*) AS n FROM template_version tv JOIN template t ON t.id = tv.template_id
+       WHERE t.author_identity_id = ?1 AND tv.published_at >= ?2`,
+  )
+    .bind(author, cutoff)
+    .first<{ n: number }>();
+  return (row?.n ?? 0) >= LIMITS.publishesPer24h;
+}
 
 function parseJson<T>(s: string | null | undefined, fallback: T): T {
   if (!s) return fallback;
@@ -280,6 +295,91 @@ async function loadVersion(env: Env, versionId: string | null): Promise<LoadedVe
       presentation_config: parseJson(c.presentation_config as string, {}),
     })),
   };
+}
+
+interface SlotInput {
+  criterion_id?: string;
+  label?: string;
+  description?: string;
+  type?: string;
+  position?: number;
+  default_active?: boolean;
+  default_weight_milli?: number;
+  scoring_config?: unknown;
+  presentation_config?: unknown;
+}
+type SlotParse = { ok: true; slots: SlotForHash[]; newCriterionIds: string[] } | { ok: false; why: string };
+
+// Build validated criterion slots for a create/revise/fork. Reused criterion ids MUST exist in
+// `lineageIds` (the source/previous version's criteria) — the client can't spoof arbitrary lineage;
+// blank ids mint a new server-owned criterion id.
+function parseSlots(input: SlotInput[], lineageIds: Set<string>): SlotParse {
+  if (!Array.isArray(input) || input.length < 1 || input.length > MAX_ACTIVE_CRITERIA) {
+    return { ok: false, why: 'criteria count' };
+  }
+  const newCriterionIds: string[] = [];
+  const slots: SlotForHash[] = [];
+  const seen = new Set<string>();
+  for (let i = 0; i < input.length; i++) {
+    const c = input[i];
+    let cid = String(c.criterion_id ?? '').trim();
+    if (cid) {
+      if (!lineageIds.has(cid)) return { ok: false, why: 'criterion_id not in source lineage' };
+    } else {
+      cid = 'crit-' + crypto.randomUUID();
+      newCriterionIds.push(cid);
+    }
+    if (seen.has(cid)) return { ok: false, why: 'duplicate criterion' };
+    seen.add(cid);
+    const label = String(c.label ?? '').trim();
+    if (!label || label.length > LIMITS.criterionLabel) return { ok: false, why: 'label' };
+    const type = String(c.type ?? 'scale');
+    if (!CRITERION_TYPES.includes(type)) return { ok: false, why: 'type' };
+    const wm = Math.round(Number(c.default_weight_milli ?? 1000));
+    if (!Number.isFinite(wm) || wm < 0) return { ok: false, why: 'weight' };
+    slots.push({
+      criterion_id: cid,
+      label,
+      description: String(c.description ?? '').slice(0, LIMITS.criterionDescription) || null,
+      type,
+      position: i + 1,
+      default_active: c.default_active !== false,
+      default_weight_milli: wm,
+      scoring_config: c.scoring_config ?? (type === 'scale' ? { min: 0, max: 5, step: 0.5 } : {}),
+      presentation_config: c.presentation_config ?? {},
+    });
+  }
+  return { ok: true, slots, newCriterionIds };
+}
+
+// The statements that persist one published version's criteria (new criterion rows + slot joins).
+function slotWrites(env: Env, versionId: string, slots: SlotForHash[], newCriterionIds: string[], nowIso: string): D1PreparedStatement[] {
+  return [
+    ...newCriterionIds.map((cid) =>
+      env.DB.prepare(`INSERT INTO criterion (id, created_at) VALUES (?1, ?2)`).bind(cid, nowIso),
+    ),
+    ...slots.map((s) =>
+      env.DB.prepare(
+        // weight_default is a 0007 vestigial NOT NULL column (no default) — mirrors milli/1000.
+        `INSERT INTO template_criterion
+           (template_version_id, criterion_id, label, description, type, position, default_active,
+            default_weight_milli, scoring_config, presentation_config, weight_default)
+           VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)`,
+      ).bind(
+        versionId,
+        s.criterion_id,
+        s.label,
+        s.description,
+        s.type,
+        s.position,
+        s.default_active ? 1 : 0,
+        s.default_weight_milli,
+        JSON.stringify(s.scoring_config),
+        JSON.stringify(s.presentation_config),
+        s.default_weight_milli / 1000,
+      ),
+    ),
+  ];
 }
 
 export default {
@@ -465,42 +565,21 @@ export default {
           sourceIds = new Set(parentVer.criteria.map((c) => c.id));
         }
 
-        const input = Array.isArray(body.criteria) ? body.criteria : [];
-        if (input.length < 1 || input.length > MAX_ACTIVE_CRITERIA) {
-          return json({ error: 'bad_request', why: 'criteria count' }, setCookie);
+        const parsed = parseSlots(body.criteria ?? [], sourceIds);
+        if (!parsed.ok) return json({ error: 'bad_request', why: parsed.why }, setCookie);
+        const { slots, newCriterionIds } = parsed;
+
+        // Flood control (E): per-identity template cap + publish rate limit.
+        const owned = await env.DB.prepare(
+          `SELECT COUNT(*) AS n FROM template WHERE author_identity_id = ?1 AND status != 'hidden'`,
+        )
+          .bind(author)
+          .first<{ n: number }>();
+        if ((owned?.n ?? 0) >= LIMITS.templatesPerIdentity) {
+          return json({ error: 'quota', why: 'max templates for this identity' }, setCookie);
         }
-        const newCriterionIds: string[] = [];
-        const slots: SlotForHash[] = [];
-        const seen = new Set<string>();
-        for (let i = 0; i < input.length; i++) {
-          const c = input[i];
-          let cid = String(c.criterion_id ?? '').trim();
-          if (cid) {
-            // A reused id must belong to the fork source — the client cannot spoof arbitrary lineage.
-            if (!sourceIds.has(cid)) return json({ error: 'bad_request', why: 'criterion_id not in source version' }, setCookie);
-          } else {
-            cid = 'crit-' + crypto.randomUUID();
-            newCriterionIds.push(cid);
-          }
-          if (seen.has(cid)) return json({ error: 'bad_request', why: 'duplicate criterion' }, setCookie);
-          seen.add(cid);
-          const label = String(c.label ?? '').trim();
-          if (!label || label.length > LIMITS.criterionLabel) return json({ error: 'bad_request', why: 'label' }, setCookie);
-          const type = String(c.type ?? 'scale');
-          if (!CRITERION_TYPES.includes(type)) return json({ error: 'bad_request', why: 'type' }, setCookie);
-          const wm = Math.round(Number(c.default_weight_milli ?? 1000));
-          if (!Number.isFinite(wm) || wm < 0) return json({ error: 'bad_request', why: 'weight' }, setCookie);
-          slots.push({
-            criterion_id: cid,
-            label,
-            description: String(c.description ?? '').slice(0, LIMITS.criterionDescription) || null,
-            type,
-            position: i + 1,
-            default_active: c.default_active !== false,
-            default_weight_milli: wm,
-            scoring_config: c.scoring_config ?? (type === 'scale' ? { min: 0, max: 5, step: 0.5 } : {}),
-            presentation_config: c.presentation_config ?? {},
-          });
+        if (await recentPublishesExceeded(env, author)) {
+          return json({ error: 'quota', why: 'max publishes per 24h' }, setCookie);
         }
 
         // Default native calculation + stars presentation (custom calc/presentation come later).
@@ -528,35 +607,167 @@ export default {
                 presentation_config, snapshot_hash, logic_hash, change_note, published_at, canonical_hash)
                VALUES (?1, ?2, 1, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 'Initial version.', ?10, ?8)`,
           ).bind(versionId, templateId, parentVersionId, name, description, JSON.stringify(calc), JSON.stringify(pres), snapshot, logic, nowIso),
-          ...newCriterionIds.map((cid) =>
-            env.DB.prepare(`INSERT INTO criterion (id, created_at) VALUES (?1, ?2)`).bind(cid, nowIso),
-          ),
-          ...slots.map((s) =>
-            env.DB.prepare(
-              // weight_default is a 0007 vestigial NOT NULL column (no default) — set = milli/1000;
-              // V3 reads default_weight_milli.
-              `INSERT INTO template_criterion
-                 (template_version_id, criterion_id, label, description, type, position, default_active,
-                  default_weight_milli, scoring_config, presentation_config, weight_default)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)`,
-            ).bind(
-              versionId,
-              s.criterion_id,
-              s.label,
-              s.description,
-              s.type,
-              s.position,
-              s.default_active ? 1 : 0,
-              s.default_weight_milli,
-              JSON.stringify(s.scoring_config),
-              JSON.stringify(s.presentation_config),
-              s.default_weight_milli / 1000,
-            ),
-          ),
+          ...slotWrites(env, versionId, slots, newCriterionIds, nowIso),
         ];
         await env.DB.batch(writes);
         return json(
           { template_id: templateId, version_id: versionId, name, tier: 'community', snapshot_hash: snapshot },
+          setCookie,
+        );
+      }
+
+      // --- Publish a REVISION of an existing template (owner only): same template_id, version_no+1,
+      // parent = the current version. Old versions stay immutable + addressable; ratings keep their
+      // version. Reused criterion ids must exist in the current version's lineage.
+      if (path.startsWith('/api/templates/') && path.endsWith('/versions') && request.method === 'POST') {
+        const templateId = path.slice('/api/templates/'.length, -'/versions'.length);
+        const tpl = await env.DB.prepare(
+          `SELECT id, author_identity_id, status, current_version_id FROM template WHERE id = ?1`,
+        )
+          .bind(templateId)
+          .first<{ id: string; author_identity_id: string; status: string; current_version_id: string }>();
+        if (!tpl) return json({ error: 'not_found' }, setCookie);
+        if (tpl.author_identity_id !== meta) return forbidden(setCookie); // owner only
+        if (tpl.status !== 'active') return json({ error: 'bad_request', why: 'template not active' }, setCookie);
+        const body = (await request.json().catch(() => ({}))) as {
+          name?: string;
+          description?: string;
+          change_note?: string;
+          criteria?: SlotInput[];
+        };
+        const name = (body.name ?? '').trim();
+        if (!name || name.length > LIMITS.name) return json({ error: 'bad_request', why: 'name' }, setCookie);
+        const description = String(body.description ?? '').slice(0, LIMITS.description);
+        const current = await loadVersion(env, tpl.current_version_id);
+        const lineageIds = new Set((current?.criteria ?? []).map((c) => c.id));
+        const parsed = parseSlots(body.criteria ?? [], lineageIds);
+        if (!parsed.ok) return json({ error: 'bad_request', why: parsed.why }, setCookie);
+        // Quotas (E): versions/template + publishes/24h.
+        const vcount = await env.DB.prepare(
+          `SELECT COUNT(*) AS n FROM template_version WHERE template_id = ?1`,
+        )
+          .bind(templateId)
+          .first<{ n: number }>();
+        if ((vcount?.n ?? 0) >= LIMITS.versionsPerTemplate) {
+          return json({ error: 'quota', why: 'max versions for this template' }, setCookie);
+        }
+        if (await recentPublishesExceeded(env, meta)) {
+          return json({ error: 'quota', why: 'max publishes per 24h' }, setCookie);
+        }
+        const nowIso = new Date().toISOString();
+        const nextNo = await env.DB.prepare(
+          `SELECT COALESCE(MAX(version_no), 0) + 1 AS n FROM template_version WHERE template_id = ?1`,
+        )
+          .bind(templateId)
+          .first<{ n: number }>();
+        const calc = { kind: 'native', aggregator: 'weighted_mean', modifiers: [] };
+        const pres = { result: 'stars', detail: 'bars' };
+        const forHash = { name, description, calculation_config: calc, presentation_config: pres, criteria: parsed.slots };
+        const snapshot = await snapshotHash(forHash);
+        const logic = await logicHash(forHash);
+        const versionId = 'tplv-' + crypto.randomUUID();
+        const writes: D1PreparedStatement[] = [
+          env.DB.prepare(
+            `INSERT INTO template_version
+               (id, template_id, version_no, parent_version_id, name, description, calculation_config,
+                presentation_config, snapshot_hash, logic_hash, change_note, published_at, canonical_hash)
+               VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?9)`,
+          ).bind(
+            versionId,
+            templateId,
+            nextNo?.n ?? 1,
+            tpl.current_version_id, // parent = the version being revised
+            name,
+            description,
+            JSON.stringify(calc),
+            JSON.stringify(pres),
+            snapshot,
+            logic,
+            String(body.change_note ?? '').slice(0, LIMITS.description) || 'Revision.',
+            nowIso,
+          ),
+          ...slotWrites(env, versionId, parsed.slots, parsed.newCriterionIds, nowIso),
+          // Advance the work's pointer to the new current version (name denormalised on the work).
+          env.DB.prepare(`UPDATE template SET current_version_id = ?1, name = ?2 WHERE id = ?3`).bind(
+            versionId,
+            name,
+            templateId,
+          ),
+        ];
+        await env.DB.batch(writes);
+        return json({ template_id: templateId, version_id: versionId, version_no: nextNo?.n ?? 1, name }, setCookie);
+      }
+
+      // --- Archive a template (owner only): drops out of discovery + blocks new ratings; historical
+      // ratings still render. Never deletes referenced published data.
+      if (path.startsWith('/api/templates/') && path.endsWith('/archive') && request.method === 'POST') {
+        const templateId = path.slice('/api/templates/'.length, -'/archive'.length);
+        const tpl = await env.DB.prepare(`SELECT author_identity_id FROM template WHERE id = ?1`)
+          .bind(templateId)
+          .first<{ author_identity_id: string }>();
+        if (!tpl) return json({ error: 'not_found' }, setCookie);
+        if (tpl.author_identity_id !== meta) return forbidden(setCookie);
+        await env.DB.prepare(`UPDATE template SET status = 'archived' WHERE id = ?1`).bind(templateId).run();
+        return json({ ok: true, template_id: templateId, status: 'archived' }, setCookie);
+      }
+
+      // --- Operator-only tier promote/demote (community <-> featured), never mutating a version.
+      // Standard is system-owned and not settable here. Gated by the admin secret (the operator).
+      if (path.startsWith('/api/templates/') && path.endsWith('/tier') && request.method === 'POST') {
+        if (!isAdmin(request, env)) return forbidden(setCookie);
+        const templateId = path.slice('/api/templates/'.length, -'/tier'.length);
+        const body = (await request.json().catch(() => ({}))) as { tier?: string };
+        const tier = String(body.tier ?? '');
+        if (tier !== 'community' && tier !== 'featured') return json({ error: 'bad_request', why: 'tier' }, setCookie);
+        const tpl = await env.DB.prepare(`SELECT tier FROM template WHERE id = ?1`)
+          .bind(templateId)
+          .first<{ tier: string }>();
+        if (!tpl) return json({ error: 'not_found' }, setCookie);
+        if (tpl.tier === 'standard') return json({ error: 'bad_request', why: 'cannot retier standard' }, setCookie);
+        await env.DB.prepare(`UPDATE template SET tier = ?1 WHERE id = ?2`).bind(tier, templateId).run();
+        return json({ ok: true, template_id: templateId, tier }, setCookie);
+      }
+
+      // --- A single template version (its criteria + config), addressable forever.
+      if (path.startsWith('/api/template-versions/') && !path.endsWith('/diff') && request.method === 'GET') {
+        const versionId = path.slice('/api/template-versions/'.length);
+        const ver = await loadVersion(env, versionId);
+        if (!ver) return json({ error: 'not_found' }, setCookie);
+        return json(ver, setCookie);
+      }
+
+      // --- Deterministic diff of a version against its parent (rename/config-change vs add/remove,
+      // keyed on the stable criterion_id).
+      if (path.startsWith('/api/template-versions/') && path.endsWith('/diff') && request.method === 'GET') {
+        const versionId = path.slice('/api/template-versions/'.length, -'/diff'.length);
+        const ver = await loadVersion(env, versionId);
+        if (!ver) return json({ error: 'not_found' }, setCookie);
+        const parentId = await env.DB.prepare(`SELECT parent_version_id FROM template_version WHERE id = ?1`)
+          .bind(versionId)
+          .first<{ parent_version_id: string | null }>();
+        const parent = parentId?.parent_version_id ? await loadVersion(env, parentId.parent_version_id) : null;
+        const before = new Map((parent?.criteria ?? []).map((c) => [c.id, c]));
+        const after = new Map(ver.criteria.map((c) => [c.id, c]));
+        const changes: Record<string, unknown>[] = [];
+        for (const [id, a] of after) {
+          const b = before.get(id);
+          if (!b) {
+            changes.push({ criterion_id: id, change: 'added', label: a.label });
+          } else {
+            const diffs: Record<string, unknown> = {};
+            if (b.label !== a.label) diffs.label = { from: b.label, to: a.label };
+            if (b.default_weight_milli !== a.default_weight_milli)
+              diffs.weight_milli = { from: b.default_weight_milli, to: a.default_weight_milli };
+            if (b.type !== a.type) diffs.type = { from: b.type, to: a.type };
+            if (b.position !== a.position) diffs.position = { from: b.position, to: a.position };
+            if (Object.keys(diffs).length) changes.push({ criterion_id: id, change: 'modified', ...diffs });
+          }
+        }
+        for (const [id, b] of before) {
+          if (!after.has(id)) changes.push({ criterion_id: id, change: 'removed', label: b.label });
+        }
+        return json(
+          { version_id: versionId, parent_version_id: parentId?.parent_version_id ?? null, changes },
           setCookie,
         );
       }

@@ -222,6 +222,34 @@ reputation presentation · 30 existing rating upsert stays atomic with criterion
 Migrations are forward-only: V2 shipped `0007` (already applied to the remote D1), so V3 evolves it via
 `0008` (both local and remote apply 0008 forward) — never rewrite 0007.
 
+## Implementation status (2026-09-07) — A–E BUILT, returned for review before F
+
+Batches **A–E are implemented + verified locally** on branch `feat/template-ecosystem-v3`:
+
+- **A schema/domain** — migration `0008` (score_bp, generic `rating_criterion_value`, versioned
+  Template/TemplateVersion, typed criterion slots, `default_weight_milli`). Forward-only over `0007`.
+- **B calculation engine** — `src/scoring.ts`: normalize (5 types) → aggregate (weighted_mean/mean/
+  median/min/max) → modifiers (cap/veto/threshold) → `score_bp` + evaluation trace.
+- **C publishing** — `POST /api/templates` (create/fork), `POST /api/templates/:id/versions` (revise,
+  owner-only), `POST /api/templates/:id/archive` (owner), `POST /api/templates/:id/tier` (operator).
+- **D hashing/diff** — `snapshot_hash` + `logic_hash` (`src/template.ts`, stable key-sorted sha256);
+  `GET /api/template-versions/:id` + `/diff` (rename vs add/remove on stable `criterion_id`).
+- **E validation** — author from meta identity (never body); fork/revise criterion lineage enforced
+  (spoofed ids rejected); length limits + quotas (10 templates/identity, 3 publishes/24h, 25
+  versions/template).
+
+**Verification:** 48 unit tests green (scoring incl. the operator's 4.325 trace example; dual-hash
+relabel invariant). Full local acceptance run passed the contract points end-to-end: create → rate
+(exact version) → revise v2 (relabel keeps criterion_id, reweight, add/remove) → v1 immutable + old
+rating still bound to v1 (no silent migration) → fork lineage + spoof rejection → diff → tier
+(standard→featured→community, featured survives) → archive (out of discovery, history renders) →
+author-spoof ignored + non-owner revise forbidden → server-authoritative profile trace.
+
+**NOT done (deliberately): F (frontend)** — the real template editor / library / detail / fork-edit /
+show-calculation surfaces. Per the contract, A–E are returned for review before the frontend build-out.
+The current front still uses the pre-F rating UI (a legacy shape is shimmed server-side so it keeps
+working). Not yet deployed to remote (0008 unapplied on remote) — awaiting review.
+
 ## OPEN DESIGN QUESTIONS — DO NOT INVENT ANSWERS
 
 Keep open unless implementation forces a minimal reversible decision (then note it): final global
