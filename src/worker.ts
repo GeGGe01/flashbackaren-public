@@ -177,13 +177,28 @@ const COMMENT_MAX_CHARS = 420;
 const COMMENT_MAX_WORDS = 88;
 // Normalise an optional free-text review: null when empty, the trimmed text when valid, or false
 // when it breaks a hard limit (≤420 chars AND ≤88 words).
-function cleanComment(raw: unknown): string | null | false {
+export function cleanComment(raw: unknown): string | null | false {
   if (raw == null) return null;
-  const s = String(raw).trim();
+  if (typeof raw !== 'string') return false; // wrong type is an invalid request, not "[object Object]"
+  const s = raw.trim();
   if (s === '') return null;
   if (s.length > COMMENT_MAX_CHARS) return false;
   if (s.split(/\s+/).filter(Boolean).length > COMMENT_MAX_WORDS) return false;
   return s;
+}
+
+// Strict string extraction for untrusted API JSON — TYPE first, never String() coercion (A–E.3).
+// Absent (undefined/null) → null unless required. Wrong type → error. Trims unless trim:false.
+export function vString(
+  v: unknown,
+  opts: { required?: boolean; max?: number; trim?: boolean } = {},
+): Valid<string | null> {
+  if (v === undefined || v === null) return opts.required ? { ok: false, error: 'required' } : { ok: true, value: null };
+  if (typeof v !== 'string') return { ok: false, error: 'must be a string' };
+  const s = opts.trim === false ? v : v.trim();
+  if (opts.required && s.length === 0) return { ok: false, error: 'required' };
+  if (opts.max !== undefined && s.length > opts.max) return { ok: false, error: 'too long' };
+  return { ok: true, value: s };
 }
 
 // Flashback serves ISO-8859-1; decode a small set of HTML entities left in usernames.
@@ -346,7 +361,10 @@ function parseSlots(input: SlotInput[], lineageIds: Set<string>): SlotParse {
   const seen = new Set<string>();
   for (let i = 0; i < input.length; i++) {
     const c = input[i];
-    let cid = String(c.criterion_id ?? '').trim();
+    // criterion_id: absent (mint a new one) or a non-empty string (reused lineage). Never coerced.
+    const cidField = vString(c.criterion_id, {});
+    if (!cidField.ok) return { ok: false, why: 'criterion_id must be a string' };
+    let cid = cidField.value ?? '';
     if (cid) {
       if (!lineageIds.has(cid)) return { ok: false, why: 'criterion_id not in source lineage' };
     } else {
@@ -355,12 +373,15 @@ function parseSlots(input: SlotInput[], lineageIds: Set<string>): SlotParse {
     }
     if (seen.has(cid)) return { ok: false, why: 'duplicate criterion' };
     seen.add(cid);
-    const label = String(c.label ?? '').trim();
-    if (!label || label.length > LIMITS.criterionLabel) return { ok: false, why: 'label' };
-    // Strict limit: reject overlong descriptions (never silently slice immutable published data).
-    const description = c.description === undefined || c.description === null ? null : String(c.description);
-    if (description !== null && description.length > LIMITS.criterionDescription) return { ok: false, why: 'criterion description too long' };
-    const type = String(c.type ?? 'scale');
+    const labelField = vString(c.label, { required: true, max: LIMITS.criterionLabel });
+    if (!labelField.ok) return { ok: false, why: 'label' };
+    const label = labelField.value as string;
+    // Strict: reject a non-string / overlong description (never silently coerce or slice).
+    const descField = vString(c.description, { max: LIMITS.criterionDescription, trim: false });
+    if (!descField.ok) return { ok: false, why: 'criterion description' };
+    const description = descField.value;
+    if (c.type !== undefined && typeof c.type !== 'string') return { ok: false, why: 'type must be a string' };
+    const type = (c.type as string | undefined) ?? 'scale';
     if (!CRITERION_TYPES.includes(type)) return { ok: false, why: 'type' };
     const wv = validateWeightMilli(c.default_weight_milli ?? 1000);
     if (!wv.ok) return { ok: false, why: 'weight' };
@@ -607,10 +628,12 @@ export default {
             presentation_config?: unknown;
           }[];
         };
-        const name = (body.name ?? '').trim();
-        if (!name || name.length > LIMITS.name) return json({ error: 'bad_request', why: 'name' }, setCookie, 400);
-        const description = String(body.description ?? '');
-        if (description.length > LIMITS.description) return json({ error: 'bad_request', why: 'description too long' }, setCookie, 400);
+        const nameV = vString(body.name, { required: true, max: LIMITS.name });
+        if (!nameV.ok) return json({ error: 'bad_request', why: 'name' }, setCookie, 400);
+        const name = nameV.value as string;
+        const descV = vString(body.description, { max: LIMITS.description, trim: false });
+        if (!descV.ok) return json({ error: 'bad_request', why: 'description' }, setCookie, 400);
+        const description = descV.value ?? '';
         const author = meta; // author from server identity — never the request body (invariant)
         const nowIso = new Date().toISOString();
 
@@ -620,8 +643,10 @@ export default {
         let rootTemplateId: string | null = null;
         let sourceIds = new Set<string>();
         let sourceVer: { calculation_config: CalculationConfig; presentation_config: Record<string, unknown> } | null = null;
-        if (body.parent_version_id) {
-          const parentVer = await loadVersion(env, String(body.parent_version_id).trim());
+        if (body.parent_version_id !== undefined && body.parent_version_id !== null) {
+          const pvV = vString(body.parent_version_id, { required: true });
+          if (!pvV.ok) return json({ error: 'bad_request', why: 'parent_version_id' }, setCookie, 400);
+          const parentVer = await loadVersion(env, pvV.value as string);
           if (!parentVer) return json({ error: 'bad_request', why: 'unknown parent_version_id' }, setCookie, 400);
           parentVersionId = parentVer.version_id;
           const t = await env.DB.prepare(`SELECT root_template_id FROM template WHERE id = ?1`)
@@ -705,12 +730,15 @@ export default {
           presentation_config?: unknown;
           criteria?: SlotInput[];
         };
-        const name = (body.name ?? '').trim();
-        if (!name || name.length > LIMITS.name) return json({ error: 'bad_request', why: 'name' }, setCookie, 400);
-        const description = String(body.description ?? '');
-        if (description.length > LIMITS.description) return json({ error: 'bad_request', why: 'description too long' }, setCookie, 400);
-        const changeNote = String(body.change_note ?? '');
-        if (changeNote.length > LIMITS.description) return json({ error: 'bad_request', why: 'change_note too long' }, setCookie, 400);
+        const nameV = vString(body.name, { required: true, max: LIMITS.name });
+        if (!nameV.ok) return json({ error: 'bad_request', why: 'name' }, setCookie, 400);
+        const name = nameV.value as string;
+        const descV = vString(body.description, { max: LIMITS.description, trim: false });
+        if (!descV.ok) return json({ error: 'bad_request', why: 'description' }, setCookie, 400);
+        const description = descV.value ?? '';
+        const cnV = vString(body.change_note, { max: LIMITS.description, trim: false });
+        if (!cnV.ok) return json({ error: 'bad_request', why: 'change_note' }, setCookie, 400);
+        const changeNote = cnV.value ?? '';
         const current = await loadVersion(env, tpl.current_version_id);
         const lineageIds = new Set((current?.criteria ?? []).map((c) => c.id));
         const parsed = parseSlots(body.criteria ?? [], lineageIds);
@@ -796,8 +824,8 @@ export default {
       if (path.startsWith('/api/templates/') && path.endsWith('/tier') && request.method === 'POST') {
         if (!isAdmin(request, env)) return forbidden(setCookie);
         const templateId = path.slice('/api/templates/'.length, -'/tier'.length);
-        const body = (await request.json().catch(() => ({}))) as { tier?: string };
-        const tier = String(body.tier ?? '');
+        const body = (await request.json().catch(() => ({}))) as { tier?: unknown };
+        const tier = body.tier;
         if (tier !== 'community' && tier !== 'featured') return json({ error: 'bad_request', why: 'tier' }, setCookie, 400);
         const tpl = await env.DB.prepare(`SELECT tier FROM template WHERE id = ?1`)
           .bind(templateId)
@@ -1069,20 +1097,25 @@ export default {
       // are kept, so the rating is reproducible forever against the exact version.
       if (path === '/api/rate' && request.method === 'POST') {
         const body = (await request.json().catch(() => ({}))) as {
-          uid?: string;
-          mode?: string;
-          stars?: number;
-          halfsteps?: number;
-          template_version_id?: string;
-          values?: { criterion_id: string; raw: unknown; weight_milli?: number }[];
+          uid?: unknown;
+          mode?: unknown;
+          stars?: unknown;
+          halfsteps?: unknown;
+          template_version_id?: unknown;
+          values?: { criterion_id?: unknown; raw?: unknown; weight_milli?: unknown }[];
           // legacy shape (pre-F front): {criteria:[{criterion_id, halfsteps, weight}]}
-          criteria?: { criterion_id: string; halfsteps: number; weight: number }[];
-          comment?: string;
+          criteria?: { criterion_id?: unknown; halfsteps?: unknown; weight?: unknown }[];
+          comment?: unknown;
         };
-        const uid = (body.uid ?? '').trim();
-        if (!uid) return json({ error: 'bad_request' }, setCookie, 400);
+        const uidV = vString(body.uid, { required: true });
+        if (!uidV.ok) return json({ error: 'bad_request', why: 'uid' }, setCookie, 400);
+        const uid = uidV.value as string;
+        // mode fails closed: if supplied it must be exactly 'direct' or 'rich' (omitted → direct/legacy).
+        if (body.mode !== undefined && body.mode !== 'direct' && body.mode !== 'rich') {
+          return json({ error: 'bad_request', why: 'mode' }, setCookie, 400);
+        }
         const comment = cleanComment(body.comment);
-        if (comment === false) return json({ error: 'comment_too_long' }, setCookie);
+        if (comment === false) return json({ error: 'bad_request', why: 'comment' }, setCookie, 400);
         const member = await env.DB.prepare(`SELECT uid FROM members WHERE uid = ?1`)
           .bind(uid)
           .first();
@@ -1103,31 +1136,43 @@ export default {
 
         if (body.mode === 'rich') {
           mode = 'rich';
-          templateVersionId = (body.template_version_id ?? '').trim();
-          const version = templateVersionId ? await loadVersion(env, templateVersionId) : null;
+          const tvV = vString(body.template_version_id, { required: true });
+          if (!tvV.ok) return json({ error: 'bad_request', why: 'template_version_id' }, setCookie, 400);
+          templateVersionId = tvV.value as string;
+          const version = await loadVersion(env, templateVersionId);
           if (!version) return json({ error: 'bad_request', why: 'unknown version' }, setCookie, 400);
           // Archived/hidden templates refuse NEW ratings (P0-3); historical reads still render.
           if (version.template_status !== 'active') {
             return json({ error: 'template_not_active' }, setCookie, 409);
           }
           const bySlot = new Map(version.criteria.map((c) => [c.id, c]));
-          // Accept the V3 {values} shape, or map the legacy {criteria:[{halfsteps,weight}]} shape.
-          const input =
-            Array.isArray(body.values) && body.values.length
-              ? body.values
-              : (body.criteria ?? []).map((c) => ({
-                  criterion_id: c.criterion_id,
-                  raw: { value: Number(c.halfsteps) / 2 }, // legacy halfsteps (0..10) → 0..5 scale value
-                  weight_milli: Math.round(Number(c.weight) * 1000),
-                }));
+          // The V3 {values} shape, or the legacy {criteria:[{halfsteps,weight}]} shape — the legacy
+          // shape is TYPE-validated BEFORE conversion (A–E.3), so string numerics don't slip through.
+          let input: { criterion_id?: unknown; raw?: unknown; weight_milli?: unknown }[];
+          if (Array.isArray(body.values) && body.values.length) {
+            input = body.values;
+          } else {
+            input = [];
+            for (const c of body.criteria ?? []) {
+              if (typeof c.criterion_id !== 'string' || !c.criterion_id) return json({ error: 'bad_request', why: 'legacy criterion_id' }, setCookie, 400);
+              if (typeof c.halfsteps !== 'number' || !Number.isInteger(c.halfsteps) || c.halfsteps < 0 || c.halfsteps > 10)
+                return json({ error: 'bad_request', why: 'legacy halfsteps' }, setCookie, 400);
+              if (typeof c.weight !== 'number' || !Number.isFinite(c.weight) || c.weight < 0)
+                return json({ error: 'bad_request', why: 'legacy weight' }, setCookie, 400);
+              const wm = Math.round(c.weight * 1000);
+              if (!validateWeightMilli(wm).ok) return json({ error: 'bad_request', why: 'legacy weight' }, setCookie, 400);
+              input.push({ criterion_id: c.criterion_id, raw: { value: c.halfsteps / 2 }, weight_milli: wm });
+            }
+          }
           if (input.length < 1 || input.length > MAX_ACTIVE_CRITERIA) {
             return json({ error: 'bad_request' }, setCookie, 400);
           }
           const seen = new Set<string>();
           const evalInputs: EvalInput[] = [];
           for (const v of input) {
-            const slot = bySlot.get(String(v.criterion_id));
-            if (!slot || seen.has(slot.id)) return json({ error: 'bad_request' }, setCookie); // lineage
+            if (typeof v.criterion_id !== 'string') return json({ error: 'bad_request', why: 'criterion_id' }, setCookie, 400);
+            const slot = bySlot.get(v.criterion_id);
+            if (!slot || seen.has(slot.id)) return json({ error: 'bad_request' }, setCookie, 400); // lineage
             seen.add(slot.id);
             // Weight bounded (P0-7): provided override or the slot default, integer 0..MAX.
             const wv = validateWeightMilli(v.weight_milli != null ? v.weight_milli : slot.default_weight_milli);

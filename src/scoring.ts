@@ -369,8 +369,8 @@ const RESULT_PRES = ['stars', 'numeric', 'percentage', 'grade', 'symbol'];
 const DETAIL_PRES = ['bars', 'radar', 'scorecard', 'bipolar'];
 export function sanitizePresentationConfig(cfg: unknown): { result: string; detail: string } {
   const c = (cfg ?? {}) as Record<string, unknown>;
-  const result = RESULT_PRES.includes(String(c.result)) ? String(c.result) : 'stars';
-  const detail = DETAIL_PRES.includes(String(c.detail)) ? String(c.detail) : 'bars';
+  const result = typeof c.result === 'string' && RESULT_PRES.includes(c.result) ? c.result : 'stars';
+  const detail = typeof c.detail === 'string' && DETAIL_PRES.includes(c.detail) ? c.detail : 'bars';
   return { result, detail };
 }
 

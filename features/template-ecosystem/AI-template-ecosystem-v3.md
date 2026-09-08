@@ -222,6 +222,28 @@ reputation presentation · 30 existing rating upsert stays atomic with criterion
 Migrations are forward-only: V2 shipped `0007` (already applied to the remote D1), so V3 evolves it via
 `0008` (both local and remote apply 0008 forward) — never rewrite 0007.
 
+## Implementation status (2026-09-08) — A–E.3 strict-input hardening (final pre-freeze)
+
+**A–E.3 applied** on `feat/template-ecosystem-v3` — the last strict-input batch before freeze (no
+schema/domain change):
+- **No `String()`/`Number()` coercion of untrusted API JSON in worker.ts.** A shared `vString()`
+  helper (type-first, trims after) validates name/description/label/criterion_id/parent_version_id/
+  change_note/tier/uid; a non-string (e.g. `{}`) now yields a deterministic **400**, never
+  `"[object Object]"` or a 500.
+- **Legacy rich-rating shim type-validated BEFORE conversion** — legacy `halfsteps`/`weight` must be
+  real numbers (not `"9"`/`"1"`) and `criterion_id` a non-empty string, else 400. Positive legacy
+  numeric requests still work until F replaces the front end.
+- **`cleanComment` strict** — non-string comment → invalid (400), not `String(anything)`.
+- **`mode` fails closed** — if supplied it must be exactly `direct` or `rich` (omitted → direct/legacy
+  compat); unknown mode → 400.
+- **`sanitizePresentationConfig` type-strict** (typeof before enum).
+
+**Verification:** **86 unit tests** (`vitest`) + `tsc --noEmit` clean (`typescript` devDependency +
+`tsconfig.json`). HTTP acceptance smoke: object-valued name/label/criterion_id/description/
+parent_version_id → 400; unknown mode → 400; legacy `"9"`/`"1"` → 400; positive legacy numerics and
+omitted-mode direct 4.5 → 200. (Worker-HTTP checks are the integration acceptance run; the pure
+helpers `vString`/`cleanComment`/scoring validators are covered by vitest.)
+
 ## Implementation status (2026-09-07) — A–E + A–E.1 + A–E.2 hardening, returned for review before F
 
 **A–E.2 (final backend hardening) applied** on `feat/template-ecosystem-v3`:
