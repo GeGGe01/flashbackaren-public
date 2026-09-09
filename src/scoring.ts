@@ -40,7 +40,7 @@ export type ScoringConfig = ScaleConfig | BooleanConfig | OrdinalConfig | Record
 
 export type Modifier =
   | { kind: 'cap'; criterion_id: string; below_bp: number; cap_bp: number }
-  | { kind: 'veto'; criterion_id: string; below_bp?: number; equals_raw?: unknown }
+  | { kind: 'veto'; criterion_id: string; below_bp?: number; equals_raw?: string | number | boolean | null }
   | { kind: 'threshold'; min_bp?: number; max_bp?: number };
 
 export interface CalculationConfig {
@@ -55,6 +55,11 @@ const isFiniteNum = (n: unknown): n is number => typeof n === 'number' && Number
 const isBp = (n: unknown): n is number => isFiniteNum(n) && n >= 0 && n <= BP_MAX && Number.isInteger(n);
 const isInt = (n: unknown): n is number => typeof n === 'number' && Number.isInteger(n);
 const isBool = (b: unknown): b is boolean => typeof b === 'boolean';
+// A plain (non-null, non-array) object — validate element shapes before property access (never 500).
+export const isRecord = (v: unknown): v is Record<string, unknown> =>
+  typeof v === 'object' && v !== null && !Array.isArray(v);
+export const MAX_MODIFIERS = 20;
+export const EQUALS_RAW_STRING_MAX = 48;
 // API JSON is validated by TYPE, never coerced (P0). No Number(...)/String(...) on untyped input:
 // Number(null)=0, Number('4.5')=4.5 etc. would let malformed JSON become a real score.
 
@@ -94,6 +99,7 @@ export function validateScoringConfig(type: CriterionType, cfg: unknown): Valid<
       const labels = new Set<string>();
       const clean: OrdinalOption[] = [];
       for (const o of options) {
+        if (!isRecord(o)) return err('ordinal: each option must be an object');
         if (typeof o.label !== 'string') return err('ordinal: option label must be a string');
         const label = o.label.trim();
         if (!label || label.length > ORDINAL_LABEL_MAX) return err('ordinal: bad option label');
@@ -205,9 +211,13 @@ export function validateCalculationConfig(cfg: unknown, criterionIds: Set<string
   }
   const aggregator = (c.aggregator ?? 'weighted_mean') as Aggregator;
   if (typeof aggregator !== 'string' || !AGGREGATORS.includes(aggregator)) return err('unknown aggregator');
-  const modsIn = Array.isArray(c.modifiers) ? (c.modifiers as Record<string, unknown>[]) : [];
+  if (c.modifiers !== undefined && !Array.isArray(c.modifiers)) return err('modifiers must be an array');
+  const modsIn = Array.isArray(c.modifiers) ? (c.modifiers as unknown[]) : [];
+  if (modsIn.length > MAX_MODIFIERS) return err(`at most ${MAX_MODIFIERS} modifiers`);
   const modifiers: Modifier[] = [];
-  for (const m of modsIn) {
+  for (const raw of modsIn) {
+    if (!isRecord(raw)) return err('each modifier must be an object'); // never read .kind off null/array
+    const m = raw;
     if (m.kind === 'threshold') {
       if (m.min_bp !== undefined && !isBp(m.min_bp)) return err('threshold: min_bp must be an integer 0..10000');
       if (m.max_bp !== undefined && !isBp(m.max_bp)) return err('threshold: max_bp must be an integer 0..10000');
@@ -224,8 +234,18 @@ export function validateCalculationConfig(cfg: unknown, criterionIds: Set<string
       if (typeof m.criterion_id !== 'string' || !criterionIds.has(m.criterion_id)) return err('veto: criterion_id not in this version');
       if (m.below_bp !== undefined && !isBp(m.below_bp)) return err('veto: below_bp must be an integer 0..10000');
       if (m.below_bp === undefined && m.equals_raw === undefined) return err('veto: below_bp or equals_raw required');
+      // equals_raw is a PRIMITIVE only (no arbitrary JSON blob storage) — matches the primitive raw
+      // values every criterion type reduces to (number/boolean/string).
+      let equals_raw: string | number | boolean | null | undefined;
+      if (m.equals_raw !== undefined) {
+        const e = m.equals_raw;
+        if (e !== null && typeof e !== 'string' && typeof e !== 'number' && typeof e !== 'boolean')
+          return err('veto: equals_raw must be a string, number, boolean or null');
+        if (typeof e === 'string' && e.length > EQUALS_RAW_STRING_MAX) return err('veto: equals_raw string too long');
+        equals_raw = e;
+      }
       const below_bp = m.below_bp as number | undefined;
-      modifiers.push({ kind: 'veto', criterion_id: m.criterion_id, ...(below_bp !== undefined ? { below_bp } : {}), ...(m.equals_raw !== undefined ? { equals_raw: m.equals_raw } : {}) });
+      modifiers.push({ kind: 'veto', criterion_id: m.criterion_id, ...(below_bp !== undefined ? { below_bp } : {}), ...(equals_raw !== undefined ? { equals_raw } : {}) });
     } else {
       return err(`unknown modifier kind: ${String(m.kind)}`);
     }
@@ -350,7 +370,8 @@ export function evaluate(calc: CalculationConfig, inputs: EvalInput[]): Evaluati
       const hit =
         !!c &&
         ((m.below_bp != null && c.bp < m.below_bp) ||
-          (m.equals_raw !== undefined && JSON.stringify((c.raw as Record<string, unknown>)?.value) === JSON.stringify(m.equals_raw)));
+          // strict primitive comparison — both sides are primitives (canonical raw value vs equals_raw)
+          (m.equals_raw !== undefined && (c.raw as Record<string, unknown>)?.value === m.equals_raw));
       if (hit) score_bp = 0;
       modifiers.push({ kind: 'veto', applied: hit, detail: `veto on ${m.criterion_id}` });
     } else if (m.kind === 'threshold') {

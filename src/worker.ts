@@ -23,6 +23,7 @@ import {
   validateCalculationConfig,
   validateWeightMilli,
   sanitizePresentationConfig,
+  isRecord,
   type CriterionType,
   type ScoringConfig,
   type CalculationConfig,
@@ -47,6 +48,9 @@ interface D1Database {
 interface Env {
   DB: D1Database;
   ADMIN_SECRET?: string; // server-side secret gating the preseed/import endpoints (wrangler secret / .dev.vars)
+  // HMAC key for the fb_meta identity cookie — proves the browser owns the meta id it presents, so the
+  // (publicly visible) author_identity_id can't be forged into an owner. DEDICATED, not ADMIN_SECRET.
+  META_SIGNING_SECRET?: string;
   // Mount prefix when served under a path route (e.g. "/flashbackaren" for typ.gegge.se/flashbackaren).
   // Empty/unset = mounted at the host root (workers.dev, a dedicated subdomain, local dev).
   BASE_PATH?: string;
@@ -125,10 +129,43 @@ async function resolveMemberUpstream(q: string, env: Env): Promise<ResolveResult
   }
 }
 
-function readMeta(request: Request): string | null {
+// fb_meta is a SIGNED cookie: `<meta_id>.<hmac>`. The meta_id is a public identifier (it shows up as
+// author_identity_id); the HMAC — over the id with META_SIGNING_SECRET — is the proof that this
+// browser owns it. Ownership/author checks therefore can't be passed by simply presenting someone
+// else's public id. HttpOnly/Secure/SameSite as before.
+async function hmacHex(secret: string, msg: string): Promise<string> {
+  const key = await crypto.subtle.importKey(
+    'raw',
+    new TextEncoder().encode(secret),
+    { name: 'HMAC', hash: 'SHA-256' },
+    false,
+    ['sign'],
+  );
+  const sig = await crypto.subtle.sign('HMAC', key, new TextEncoder().encode(msg));
+  return [...new Uint8Array(sig)].map((b) => b.toString(16).padStart(2, '0')).join('');
+}
+
+// The cookie VALUE for a meta id. Without a signing secret we can't sign — the returned value won't
+// verify on the next request (→ a fresh ephemeral identity each time), which is safe (no forgery) but
+// loses persistent ownership; production must set META_SIGNING_SECRET.
+async function signMetaCookie(env: Env, metaId: string): Promise<string> {
+  if (!env.META_SIGNING_SECRET) return metaId;
+  return `${metaId}.${await hmacHex(env.META_SIGNING_SECRET, metaId)}`;
+}
+
+// Return the meta id ONLY when the cookie carries a valid signature. Unsigned/tampered/missing → null.
+async function readMeta(request: Request, env: Env): Promise<string | null> {
   const raw = request.headers.get('Cookie') ?? '';
   const m = raw.match(/(?:^|;\s*)fb_meta=([^;]+)/);
-  return m ? decodeURIComponent(m[1]) : null;
+  if (!m) return null;
+  const cookie = decodeURIComponent(m[1]);
+  const dot = cookie.lastIndexOf('.');
+  if (dot <= 0) return null; // unsigned prototype cookie → not authenticated (rotate to a signed one)
+  const id = cookie.slice(0, dot);
+  const sig = cookie.slice(dot + 1);
+  if (!env.META_SIGNING_SECRET) return null; // can't verify → don't trust
+  const expected = await hmacHex(env.META_SIGNING_SECRET, id);
+  return timingSafeEqual(sig, expected) ? id : null;
 }
 
 function json(body: unknown, extraHeaders?: Record<string, string>, status = 200): Response {
@@ -361,6 +398,7 @@ function parseSlots(input: SlotInput[], lineageIds: Set<string>): SlotParse {
   const seen = new Set<string>();
   for (let i = 0; i < input.length; i++) {
     const c = input[i];
+    if (!isRecord(c)) return { ok: false, why: 'each criterion must be an object' }; // reject [null] etc.
     // criterion_id: absent (mint a new one) or a non-empty string (reused lineage). Never coerced.
     const cidField = vString(c.criterion_id, {});
     if (!cidField.ok) return { ok: false, why: 'criterion_id must be a string' };
@@ -475,16 +513,17 @@ export default {
 
     // Resolve the browser-owned meta identity; mint one on first contact. This is only an
     // OWNERSHIP key (one browser = one current rating per member), not a person and not hardened.
-    let meta = readMeta(request);
+    let meta = await readMeta(request, env);
     let setCookie: Record<string, string> | undefined;
     if (!meta) {
       meta = crypto.randomUUID();
+      const cookieVal = await signMetaCookie(env, meta); // `<id>.<hmac>` — the proof-of-ownership
       // Secure over HTTPS (production / workers.dev); omitted on local http dev so the cookie still sets.
       const secure = url.protocol === 'https:' ? '; Secure' : '';
       // Scope the cookie to the mount prefix so it doesn't leak to sibling paths on a shared host.
       const cookiePath = base || '/';
       setCookie = {
-        'Set-Cookie': `${COOKIE}=${meta}; Path=${cookiePath}; Max-Age=${TEN_YEARS}; SameSite=Lax; HttpOnly${secure}`,
+        'Set-Cookie': `${COOKIE}=${cookieVal}; Path=${cookiePath}; Max-Age=${TEN_YEARS}; SameSite=Lax; HttpOnly${secure}`,
       };
     }
 
@@ -1154,6 +1193,7 @@ export default {
           } else {
             input = [];
             for (const c of body.criteria ?? []) {
+              if (!isRecord(c)) return json({ error: 'bad_request', why: 'legacy criterion' }, setCookie, 400);
               if (typeof c.criterion_id !== 'string' || !c.criterion_id) return json({ error: 'bad_request', why: 'legacy criterion_id' }, setCookie, 400);
               if (typeof c.halfsteps !== 'number' || !Number.isInteger(c.halfsteps) || c.halfsteps < 0 || c.halfsteps > 10)
                 return json({ error: 'bad_request', why: 'legacy halfsteps' }, setCookie, 400);
@@ -1170,6 +1210,7 @@ export default {
           const seen = new Set<string>();
           const evalInputs: EvalInput[] = [];
           for (const v of input) {
+            if (!isRecord(v)) return json({ error: 'bad_request', why: 'each value must be an object' }, setCookie, 400);
             if (typeof v.criterion_id !== 'string') return json({ error: 'bad_request', why: 'criterion_id' }, setCookie, 400);
             const slot = bySlot.get(v.criterion_id);
             if (!slot || seen.has(slot.id)) return json({ error: 'bad_request' }, setCookie, 400); // lineage

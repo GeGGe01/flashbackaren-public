@@ -1,0 +1,6 @@
+# Local dev secrets for `wrangler dev`. Copy to `.dev.vars` (gitignored) and adjust.
+# Gates the admin / preseed / import endpoints — 403 unless set (fail-closed).
+ADMIN_SECRET="dev-local-secret-change-me"
+# HMAC key for the signed fb_meta identity cookie (proof a browser owns its meta id). REQUIRED for
+# persistent ownership; without it every request gets a fresh ephemeral identity.
+META_SIGNING_SECRET="dev-local-meta-signing-change-me"

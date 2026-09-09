@@ -292,3 +292,46 @@ describe('P0: type-strict validation (no JS coercion)', () => {
     expect(validateCalculationConfig({ kind: 'garbage', aggregator: 'weighted_mean' }, new Set()).ok).toBe(false);
   });
 });
+
+// ---- A–E freeze security patch: bounded modifiers, primitive equals_raw, array-element shapes ----
+import { validateScoringConfig as vsc } from './scoring';
+
+describe('bounded / well-formed calculation modifiers (P0)', () => {
+  const ids = new Set(['a', 'b']);
+  it('rejects more than MAX_MODIFIERS', () => {
+    const many = Array.from({ length: 21 }, () => ({ kind: 'threshold', min_bp: 0 }));
+    expect(validateCalculationConfig({ kind: 'native', modifiers: many }, ids).ok).toBe(false);
+  });
+  it('rejects a non-object modifier element (null/string/array) — no runtime exception', () => {
+    expect(validateCalculationConfig({ kind: 'native', modifiers: [null] }, ids).ok).toBe(false);
+    expect(validateCalculationConfig({ kind: 'native', modifiers: ['x'] }, ids).ok).toBe(false);
+    expect(validateCalculationConfig({ kind: 'native', modifiers: [[]] }, ids).ok).toBe(false);
+  });
+  it('rejects modifiers that is not an array', () => {
+    expect(validateCalculationConfig({ kind: 'native', modifiers: 'x' }, ids).ok).toBe(false);
+  });
+});
+
+describe('veto.equals_raw is a bounded primitive (P0)', () => {
+  const ids = new Set(['a']);
+  const veto = (equals_raw: unknown) => validateCalculationConfig({ kind: 'native', modifiers: [{ kind: 'veto', criterion_id: 'a', equals_raw }] }, ids);
+  it('accepts string/number/boolean/null', () => {
+    expect(veto('Nej').ok).toBe(true);
+    expect(veto(5).ok).toBe(true);
+    expect(veto(true).ok).toBe(true);
+    expect(veto(null).ok).toBe(true);
+  });
+  it('rejects an object/array (no arbitrary JSON blob storage)', () => {
+    expect(veto({ foo: 'bar' }).ok).toBe(false);
+    expect(veto([1, 2]).ok).toBe(false);
+  });
+  it('rejects an over-long string', () => {
+    expect(veto('x'.repeat(49)).ok).toBe(false);
+  });
+});
+
+describe('ordinal option element shapes (P1)', () => {
+  it('rejects a null option element', () => {
+    expect(vsc('ordinal', { options: [null] }).ok).toBe(false);
+  });
+});
