@@ -1,7 +1,7 @@
 // Flashbackaren — v1-core see-and-feel slice.
 // The irreducible loop: find a member -> rate them (direct 0-5, half-star) -> see the aggregate.
 // Deliberately trivial to game (no anti-abuse hardening) — the point of the first surface is to
-// feel the reputation model with honest users, not to resist abuse. See PoAG.md / the AI docs.
+// feel the reputation model with honest users, not to resist abuse.
 
 // All Flashback bytes cross exactly one boundary — the FlashbackNormalizer — which yields canonical
 // UTF-8 + source metadata. Nothing below decodes upstream bytes itself; parsers assume UTF-8.

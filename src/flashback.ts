@@ -8,11 +8,10 @@
 //   3. <meta charset> / <meta http-equiv content-type>
 //   4. fallback heuristic (Flashback's legacy default: ISO-8859-1)
 
-// Honest, identifying User-Agent so Flashback can attribute our traffic and reach the operator
-// directly (native PM link) if anything pushes too hard — instead of blanket-blocking an anonymous
-// scraper. Every FlashbackNormalizer fetch sends this.
-const UA =
-  'Flashbackaren/0.1 (prototyp; kontakta oss via Flashback-PM: https://www.flashback.org/private.php?do=newpm&u=135422)';
+// Honest, identifying User-Agent so the forum can attribute this traffic and reach a contact if
+// anything pushes too hard — instead of blanket-blocking an anonymous scraper. Every
+// FlashbackNormalizer fetch sends this. Set a real contact channel for your own deployment.
+const UA = 'Flashbackaren/0.1 (prototype; contact: see the project repository)';
 
 export interface FlashbackResponse {
   ok: boolean;
